@@ -1,0 +1,5 @@
+# Large files
+dataset/data/
+
+# Others
+.DS_Store
