@@ -1,11 +1,42 @@
 # Dataset
----
-This is a real trace dataset obtained by running PARSEC on USIMM.
-The dataset is released along with the source code on [USIMM](https://utaharch.blogspot.com/2012/02/usimm.html).
 
-We use `count_to_timestamp.py` to transform the strucutre of the data into what we need, i.e., timestamp of each instruction.
+This directory contains raw USIMM trace files and tools for preprocessing.
 
-The dataset is zipped into 4 files, use `unzip-all.sh` to inflate them.
+## Raw Traces
+
+- `MT0-canneal.zip`, `MT1-canneal.zip`, `MT2-canneal.zip`, `MT3-canneal.zip`: Compressed raw USIMM traces
+- `data/`: Uncompressed traces (after running `./unzip-all.sh`)
+
+Raw trace format: `count op address [pc]`
+
+## Preprocessing
+
+Convert raw traces to timestamped format:
+
+```bash
+./convert_all_traces.sh [NON_MEM_LATENCY] [MEM_LATENCY]
+```
+
+Examples:
+```bash
+# Use defaults (non-mem-latency=1, mem-latency=20)
+./convert_all_traces.sh
+
+# Custom parameters
+./convert_all_traces.sh 1 20
+./convert_all_traces.sh 2 30
+```
+
+Timestamped traces are saved to `timestamped_traces/` directory.
+
+Timestamped trace format: `timestamp op address [pc]`
+
+## Files
+
+- `count_to_timestamp.py`: Convert raw traces to timestamped format
+- `convert_all_traces.sh`: Batch convert all traces
+- `unzip-all.sh`: Decompress all trace files
 
 ## Reference
-Chatterjee, Niladrish, et al. "Usimm: the utah simulated memory module." University of Utah, Tech. Rep (2012): 1-24.
+
+Chatterjee, Niladrish, et al. "Usimm: the utah simulated memory module." University of Utah, Tech. Rep (2012).
