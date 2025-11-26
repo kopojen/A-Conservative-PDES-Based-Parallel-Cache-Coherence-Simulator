@@ -2,6 +2,6 @@
 
 mkdir -p data
 
-for i in {0..4}; do
+for i in {0..3}; do
   unzip "MT${i}-canneal.zip" -d data
 done

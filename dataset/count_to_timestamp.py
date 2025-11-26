@@ -132,7 +132,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             args.non_mem_latency,
             args.mem_latency,
         )
-        print(f"Wrote {output_path}")
+        print(f"Wrote {output_path}", file=__import__('sys').stderr)
 
 
 if __name__ == "__main__":
