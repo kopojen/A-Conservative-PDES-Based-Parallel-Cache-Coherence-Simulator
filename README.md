@@ -50,7 +50,6 @@ Multiple cores:
 ### `src/trace_reader.cpp`
 - Parses timestamped trace files
 - Auto-detects and handles different address formats (hex/decimal)
-- Fixes USIMM format quirks (Ox → 0x)
 - Yields events one-by-one
 
 ### `src/msi_cache.cpp`
@@ -58,8 +57,3 @@ Multiple cores:
 - Maintains cache line states: Invalid, Shared, Modified
 - Tracks per-core hit/miss statistics
 - Processes read/write operations and state transitions
-
-## Requirements
-
-- C++17 or later
-- Python 3 (for trace preprocessing)
