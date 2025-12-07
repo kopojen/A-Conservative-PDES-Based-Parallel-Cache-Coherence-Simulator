@@ -1,15 +1,12 @@
 # Dataset
 
-This directory contains raw USIMM trace files and tools for preprocessing.
+This directory contains timestamped USIMM trace files and tools for preprocessing.
 
 ## Raw Traces
 
-- `MT0-canneal.zip`, `MT1-canneal.zip`, `MT2-canneal.zip`, `MT3-canneal.zip`: Compressed raw USIMM traces
-- `data/`: Uncompressed traces (after running `./unzip-all.sh`)
+The original data included in the open-source code can be found in the [usimm blog post](https://utaharch.blogspot.com/2012/02/usimm.html).
 
-Raw trace format: `count op address [pc]`
-
-## Preprocessing
+### Preprocessing
 
 Convert raw traces to timestamped format:
 
@@ -34,8 +31,12 @@ Timestamped trace format: `timestamp op address [pc]`
 ## Files
 
 - `count_to_timestamp.py`: Convert raw traces to timestamped format
-- `convert_all_traces.sh`: Batch convert all traces
+- `convert_all_traces.sh`: Batch convert all raw traces
 - `unzip-all.sh`: Decompress all trace files
+- `MT0-canneal.zip`, `MT1-canneal.zip`, `MT2-canneal.zip`, `MT3-canneal.zip`: Compressed timestamped USIMM traces
+- `data/`: Uncompressed timestamped traces after running `./unzip-all.sh`
+
+Raw trace format: `count op address [pc]`
 
 ## Reference
 
