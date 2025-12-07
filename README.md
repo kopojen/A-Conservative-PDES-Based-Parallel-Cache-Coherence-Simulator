@@ -6,18 +6,17 @@ Sequential simulator for multi-core memory traces using MSI cache coherence prot
 
 ### 1. Prepare Traces
 
-```bash
-cd dataset
-./convert_all_traces.sh <non-memory latency> <memory latency>
-cd ..
-```
+Either by using the traces we have processed or by downloading the original traces.
 
-Example:
-```bash
-./convert_all_traces.sh 1 20
-```
+1. Use the dataset we have processed
+    ```bash
+    cd dataset
+    ./upzip-all.sh
+    ```
+    You will get all traces under dataset/data
 
-This converts raw USIMM traces to timestamped format. See `dataset/README.md` for details and custom parameters.
+2. Download the original dataset
+    Please follow the instruction in [dataset/README.md](dataset/README.md#raw-traces) to download the raw traces and process them.
 
 ### 2. Compile
 
@@ -31,12 +30,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic \
 
 Single core:
 ```bash
-./baseline dataset/timestamped_traces/MT0-canneal.ts
+./baseline dataset/data/MT0-canneal
 ```
 
 Multiple cores:
 ```bash
-./baseline dataset/timestamped_traces/MT{0,1,2,3}-canneal.ts
+./baseline dataset/data/MT{0,1,2,3}-canneal
 ```
 
 ## Code Structure
