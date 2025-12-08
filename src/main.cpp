@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Trace files: " << streams.size() << "\n";
     std::cout << "Starting simulation...\n\n";
 
-    MSICache cache(num_cores);
+    SnoopyMSI cache(num_cores);
 
     std::priority_queue<ScheduledEvent, std::vector<ScheduledEvent>,
                         EventEarlier>
