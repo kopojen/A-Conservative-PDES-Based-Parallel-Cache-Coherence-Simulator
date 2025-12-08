@@ -8,6 +8,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -28,6 +30,9 @@ struct CoreStream {
   uint32_t core_id{};
   std::unique_ptr<TraceReader> reader;
 };
+
+std::atomic<bool> g_stop_requested{false};
+volatile std::sig_atomic_t g_signal_flag = 0;
 
 constexpr uint64_t kLineSizeBytes = 64;
 constexpr uint64_t kCacheSizeBytes = 32 * 1024;
@@ -56,6 +61,22 @@ struct CoreWorker {
   std::shared_ptr<BusMailbox> mailbox;
   std::thread thread;
 };
+
+bool StopRequested() {
+  if (g_signal_flag != 0) {
+    g_stop_requested.store(true, std::memory_order_relaxed);
+  }
+  return g_stop_requested.load(std::memory_order_relaxed);
+}
+
+void HandleSignal(int) {
+  g_signal_flag = 1;
+}
+
+void InstallSignalHandlers() {
+  std::signal(SIGINT, HandleSignal);
+  std::signal(SIGTERM, HandleSignal);
+}
 
 void DrainBusMessages(CoreWorker& worker) {
   BusMessage msg;
@@ -109,7 +130,7 @@ void HandleWrite(CoreWorker& worker, uint64_t line_addr) {
 
 void RunCore(CoreWorker* worker) {
   if (!worker) return;
-  while (true) {
+  while (!StopRequested()) {
     DrainBusMessages(*worker);
     auto ev = worker->reader->Next();
     if (!ev) break;
@@ -189,6 +210,8 @@ int main(int argc, char* argv[]) {
   try {
     const auto specs = CollectTraceSpecs(argc, argv);
     auto streams = BuildStreams(specs);
+
+    InstallSignalHandlers();
 
     uint32_t max_core_id = 0;
     for (const auto& s : streams) {

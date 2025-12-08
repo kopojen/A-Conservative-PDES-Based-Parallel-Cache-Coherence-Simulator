@@ -5,8 +5,8 @@
 
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,8 +27,17 @@ class TraceReader {
   const std::filesystem::path& path() const { return path_; }
 
  private:
+  struct MmapDeleter {
+    size_t length{0};
+    void operator()(const char* data) const;
+  };
+  using MappingPtr = std::unique_ptr<const char, MmapDeleter>;
+
   std::filesystem::path path_;
   uint32_t default_core_id_{};
   bool file_embeds_core_{false};
-  std::unique_ptr<std::ifstream> stream_;
+  int fd_{-1};
+  MappingPtr mapping_{nullptr, MmapDeleter{0}};
+  size_t length_{0};
+  size_t offset_{0};
 };
