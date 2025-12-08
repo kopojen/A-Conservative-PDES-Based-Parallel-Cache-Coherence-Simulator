@@ -9,29 +9,29 @@ Total events processed: 41988739
 Core 0:
   Reads  : 7394733
   Writes : 3438117
-  Hits   : 4515136
-  Misses : 6317714
-  Hit Rate: 41.68%
+  Hits   : 80744
+  Misses : 10752106
+  Hit Rate: 0.75%
 
 Core 1:
   Reads  : 7085879
   Writes : 3292632
-  Hits   : 4202597
-  Misses : 6175914
-  Hit Rate: 40.49%
+  Hits   : 79994
+  Misses : 10298517
+  Hit Rate: 0.77%
 
 Core 2:
   Reads  : 7101376
   Writes : 3302707
-  Hits   : 4212055
-  Misses : 6192028
-  Hit Rate: 40.48%
+  Hits   : 79622
+  Misses : 10324461
+  Hit Rate: 0.77%
 
 Core 3:
   Reads  : 7080996
   Writes : 3292299
-  Hits   : 4203018
-  Misses : 6170277
-  Hit Rate: 40.52%
+  Hits   : 79713
+  Misses : 10293582
+  Hit Rate: 0.77%
 
-Overall Hit Rate: 40.80%
+Overall Hit Rate: 0.76%
