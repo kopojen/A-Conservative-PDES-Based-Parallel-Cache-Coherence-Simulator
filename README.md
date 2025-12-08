@@ -21,8 +21,8 @@ Either by using the traces we have processed or by downloading the original trac
 ### 2. Compile
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -pedantic \
-    -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp \
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
+    -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp src/bus.cpp \
     -o baseline
 ```
 
@@ -40,7 +40,7 @@ Multiple cores:
 
 ## Cache Configuration
 
-The current simulator models private L1 caches with the following parameters:
+The simulator models private L1 caches with the following parameters:
 - 64-byte cache lines (addresses normalized to line granularity)
 - 32 KB capacity per core, implemented as 64 sets with 8-way associativity
 - True LRU replacement within each set

@@ -28,7 +28,7 @@ struct CoreStats {
  * @brief Private MSI cache for a single core with fixed line size/capacity.
  *
  * This class only tracks the local view (lines + states) plus LRU info. Global
- * coherence is coordinated externally through snooping.
+ * coherence is coordinated externally through message-based snooping.
  */
 class MSICache {
  public:
@@ -44,6 +44,8 @@ class MSICache {
   void InsertOrUpdate(uint64_t line_addr, State state);
   void SetState(uint64_t line_addr, State state);
   void Invalidate(uint64_t line_addr);
+  void HandleExternalReadMiss(uint64_t line_addr);
+  void HandleExternalWriteMiss(uint64_t line_addr);
 
  private:
   struct LineInfo {
@@ -61,32 +63,4 @@ class MSICache {
   uint32_t core_id_{0};
   std::unordered_map<uint64_t, LineInfo> lines_;
   std::vector<std::list<uint64_t>> lru_per_set_;
-};
-
-/**
- * @brief Snoopy MSI coherence controller coordinating per-core caches.
- */
-class SnoopyMSI {
- public:
-  explicit SnoopyMSI(uint32_t num_cores);
-
-  void Process(const TraceEvent& ev);
-  const std::vector<CoreStats>& stats() const { return stats_; }
-
- private:
-  static constexpr uint64_t kLineSizeBytes = 64;
-  static constexpr uint64_t kCacheSizeBytes = 32 * 1024;
-  static constexpr uint32_t kAssociativity = 8;
-
-  uint64_t NormalizeAddress(uint64_t addr) const {
-    return addr & ~(kLineSizeBytes - 1);
-  }
-
-  void ProcessRead(uint32_t core_id, uint64_t line_addr);
-  void ProcessWrite(uint32_t core_id, uint64_t line_addr);
-  void SnoopReadMiss(uint32_t requester, uint64_t line_addr);
-  void SnoopWriteMiss(uint32_t requester, uint64_t line_addr);
-
-  std::vector<MSICache> caches_;
-  std::vector<CoreStats> stats_;
 };

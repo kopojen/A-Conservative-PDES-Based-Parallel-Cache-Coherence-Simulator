@@ -6,7 +6,6 @@
 #include "msi_cache.h"
 
 #include <stdexcept>
-#include <string>
 
 namespace {
 
@@ -32,7 +31,8 @@ MSICache::MSICache(uint32_t core_id, size_t cache_size_bytes,
 
   const size_t num_lines = cache_size_bytes / line_size_bytes;
   if ((num_lines % associativity_) != 0) {
-    throw std::invalid_argument("cache_size/line_size must be divisible by associativity");
+    throw std::invalid_argument(
+        "cache_size/line_size must be divisible by associativity");
   }
 
   num_sets_ = static_cast<uint32_t>(num_lines / associativity_);
@@ -120,96 +120,16 @@ void MSICache::EvictIfNecessary(uint32_t set_idx) {
   lines_.erase(victim);
 }
 
-SnoopyMSI::SnoopyMSI(uint32_t num_cores) {
-  if (num_cores == 0) {
-    throw std::invalid_argument("num_cores must be > 0");
-  }
-
-  caches_.reserve(num_cores);
-  stats_.resize(num_cores);
-
-  for (uint32_t core = 0; core < num_cores; ++core) {
-    caches_.emplace_back(core, kCacheSizeBytes, kLineSizeBytes,
-                         kAssociativity);
-  }
-}
-
-void SnoopyMSI::Process(const TraceEvent& ev) {
-  if (ev.core_id >= caches_.size()) {
-    throw std::runtime_error("core_id out of range: " +
-                             std::to_string(ev.core_id));
-  }
-
-  const uint64_t line_addr = NormalizeAddress(ev.address);
-  auto& stat = stats_[ev.core_id];
-
-  if (ev.is_write) {
-    stat.writes++;
-    ProcessWrite(ev.core_id, line_addr);
-  } else {
-    stat.reads++;
-    ProcessRead(ev.core_id, line_addr);
-  }
-}
-
-void SnoopyMSI::ProcessRead(uint32_t core_id, uint64_t line_addr) {
-  auto& cache = caches_[core_id];
-  auto& stat = stats_[core_id];
-  const auto state = cache.GetState(line_addr);
-
-  if (state == MSICache::State::Shared ||
-      state == MSICache::State::Modified) {
-    stat.hits++;
-    cache.Touch(line_addr);
+void MSICache::HandleExternalReadMiss(uint64_t line_addr) {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
     return;
   }
-
-  stat.misses++;
-  SnoopReadMiss(core_id, line_addr);
-  cache.InsertOrUpdate(line_addr, MSICache::State::Shared);
-}
-
-void SnoopyMSI::ProcessWrite(uint32_t core_id, uint64_t line_addr) {
-  auto& cache = caches_[core_id];
-  auto& stat = stats_[core_id];
-  const auto state = cache.GetState(line_addr);
-
-  if (state == MSICache::State::Modified) {
-    stat.hits++;
-    cache.Touch(line_addr);
-    return;
-  }
-
-  stat.misses++;
-  SnoopWriteMiss(core_id, line_addr);
-
-  if (state == MSICache::State::Shared) {
-    cache.SetState(line_addr, MSICache::State::Modified);
-    cache.Touch(line_addr);
-  } else {
-    cache.InsertOrUpdate(line_addr, MSICache::State::Modified);
+  if (it->second.state == State::Modified) {
+    it->second.state = State::Shared;
   }
 }
 
-void SnoopyMSI::SnoopReadMiss(uint32_t requester, uint64_t line_addr) {
-  for (uint32_t core = 0; core < caches_.size(); ++core) {
-    if (core == requester) {
-      continue;
-    }
-    auto& cache = caches_[core];
-    const auto state = cache.GetState(line_addr);
-    if (state == MSICache::State::Modified) {
-      // Write back is omitted here
-      cache.SetState(line_addr, MSICache::State::Shared);
-    }
-  }
-}
-
-void SnoopyMSI::SnoopWriteMiss(uint32_t requester, uint64_t line_addr) {
-  for (uint32_t core = 0; core < caches_.size(); ++core) {
-    if (core == requester) {
-      continue;
-    }
-    caches_[core].Invalidate(line_addr);
-  }
+void MSICache::HandleExternalWriteMiss(uint64_t line_addr) {
+  Invalidate(line_addr);
 }
