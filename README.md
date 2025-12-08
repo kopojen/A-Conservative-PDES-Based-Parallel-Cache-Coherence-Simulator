@@ -38,6 +38,15 @@ Multiple cores:
 ./baseline dataset/data/MT{0,1,2,3}-canneal
 ```
 
+## Cache Configuration
+
+The current simulator models private L1 caches with the following parameters:
+- 64-byte cache lines (addresses normalized to line granularity)
+- 32 KB capacity per core, implemented as 64 sets with 8-way associativity
+- True LRU replacement within each set
+- MSI coherence maintained via a snoopy bus protocol
+- All caches are L1 only; there is no shared lower-level cache
+
 ## Code Structure
 
 ### `src/main.cpp`
