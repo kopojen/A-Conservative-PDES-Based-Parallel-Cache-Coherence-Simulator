@@ -1,8 +1,9 @@
 # Large files
 dataset/data/
 
-# Executables
+# Compilation
 /baseline
+*.o
 
 # Others
 .DS_Store
