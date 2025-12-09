@@ -50,13 +50,13 @@ The simulator models private L1 caches with the following parameters:
 ## Code Structure
 
 ### `src/main.cpp`
-- Parses command-line arguments
-- Creates streaming trace readers for each core
-- Merges all events in timestamp order using global priority queue
-- Processes events sequentially through cache simulator
+- Parses command-line arguments and builds a trace reader per requested core
+- Registers every core with the global snoopy bus and spawns one worker thread per core
+- Each worker thread processes its own trace stream, drives its private cache, and consumes bus events
+- Global hit/miss statistics are aggregated after all workers finish
 
 ### `src/trace_reader.cpp`
-- Parses timestamped trace files
+- Memory-maps trace files for zero-copy parsing and guarantees safe unmapping
 - Auto-detects and handles different address formats (hex/decimal)
 - Yields events one-by-one
 
@@ -64,4 +64,7 @@ The simulator models private L1 caches with the following parameters:
 - Implements MSI cache coherence protocol
 - Maintains cache line states: Invalid, Shared, Modified
 - Tracks per-core hit/miss statistics
-- Processes read/write operations and state transitions
+
+### `src/bus.cpp`
+- Implements the global lock-free ring buffer used to broadcast snoopy events
+- Each broadcast reserves a slot via an atomic tail pointer; subscribers track their own read indices

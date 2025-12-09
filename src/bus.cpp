@@ -1,57 +1,70 @@
 /**
  * @file bus.cpp
- * @brief Message bus implementation for cache coherence events.
+ * @brief Lock-free global ring buffer for snoopy events.
  */
 
 #include "bus.h"
 
+#include <memory>
 #include <stdexcept>
+#include <thread>
 
-void BusMailbox::Push(const BusMessage& msg) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  queue_.push(msg);
+BusSubscription::BusSubscription(Bus* bus, uint32_t core_id,
+                                 uint64_t start_seq)
+    : bus_(bus), core_id_(core_id), read_index_(start_seq) {}
+
+bool BusSubscription::Next(BusMessage& msg) {
+  if (!bus_) return false;
+  return bus_->Poll(read_index_, msg);
 }
 
-bool BusMailbox::TryPop(BusMessage& msg) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (queue_.empty()) {
-    return false;
-  }
-  msg = queue_.front();
-  queue_.pop();
-  return true;
-}
-
-Bus::Bus(uint32_t num_cores) : mailboxes_(num_cores) {
+Bus::Bus(uint32_t num_cores) {
   if (num_cores == 0) {
     throw std::invalid_argument("num_cores must be > 0");
   }
+  slots_ = std::make_unique<Slot[]>(capacity_);
+  for (size_t i = 0; i < capacity_; ++i) {
+    slots_[i].ready.store(0, std::memory_order_relaxed);
+  }
 }
 
-std::shared_ptr<BusMailbox> Bus::RegisterMailbox(uint32_t core_id) {
-  auto mailbox = std::make_shared<BusMailbox>();
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (core_id >= mailboxes_.size()) {
-    throw std::out_of_range("core_id out of range in RegisterMailbox");
-  }
-  mailboxes_[core_id] = mailbox;
-  return mailbox;
+BusSubscription Bus::RegisterSubscription(uint32_t core_id) {
+  return BusSubscription(this, core_id, tail_.load(std::memory_order_acquire));
 }
 
 void Bus::Broadcast(const BusMessage& msg) {
-  std::vector<std::shared_ptr<BusMailbox>> snapshot;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshot = mailboxes_;
-  }
+  const uint64_t seq = tail_.fetch_add(1, std::memory_order_acq_rel);
+  const size_t idx = static_cast<size_t>(seq & mask_);
+  slots_[idx].msg = msg;
+  slots_[idx].ready.store(seq + 1, std::memory_order_release);
+}
 
-  for (uint32_t core = 0; core < snapshot.size(); ++core) {
-    if (core == msg.source_core) {
+bool Bus::Poll(uint64_t& read_index, BusMessage& msg) {
+  while (true) {
+    uint64_t current_tail = tail_.load(std::memory_order_acquire);
+    if (read_index >= current_tail) {
+      return false;
+    }
+
+    const uint64_t safe_start =
+        (current_tail > capacity_) ? current_tail - capacity_ : 0;
+    if (read_index < safe_start) {
+      read_index = safe_start;
       continue;
     }
-    const auto& mailbox = snapshot[core];
-    if (mailbox) {
-      mailbox->Push(msg);
+
+    const size_t idx = static_cast<size_t>(read_index & mask_);
+    const uint64_t expected = read_index + 1;
+    const uint64_t ready_value =
+        slots_[idx].ready.load(std::memory_order_acquire);
+
+    if (ready_value < expected) {
+      std::this_thread::yield();
+      continue;
     }
+
+    msg = slots_[idx].msg;
+    read_index++;
+    return true;
   }
 }

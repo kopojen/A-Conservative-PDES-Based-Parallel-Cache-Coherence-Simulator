@@ -49,16 +49,15 @@ struct CoreWorker {
         reader(std::move(reader_ptr)),
         cache(id, kCacheSizeBytes, kLineSizeBytes, kAssociativity),
         stats(&stats_ref),
-        bus(&bus_ref) {
-    mailbox = bus->RegisterMailbox(core_id);
-  }
+        bus(&bus_ref),
+        subscription(bus->RegisterSubscription(core_id)) {}
 
   uint32_t core_id{0};
   std::unique_ptr<TraceReader> reader;
   MSICache cache;
   CoreStats* stats{nullptr};
   Bus* bus{nullptr};
-  std::shared_ptr<BusMailbox> mailbox;
+  BusSubscription subscription;
   std::thread thread;
 };
 
@@ -78,9 +77,12 @@ void InstallSignalHandlers() {
   std::signal(SIGTERM, HandleSignal);
 }
 
-void DrainBusMessages(CoreWorker& worker) {
+void ProcessBusEvents(CoreWorker& worker) {
   BusMessage msg;
-  while (worker.mailbox->TryPop(msg)) {
+  while (worker.subscription.Next(msg)) {
+    if (msg.source_core == worker.core_id) {
+      continue;
+    }
     if (msg.type == BusMessageType::ReadMiss) {
       worker.cache.HandleExternalReadMiss(msg.line_addr);
     } else {
@@ -131,7 +133,7 @@ void HandleWrite(CoreWorker& worker, uint64_t line_addr) {
 void RunCore(CoreWorker* worker) {
   if (!worker) return;
   while (!StopRequested()) {
-    DrainBusMessages(*worker);
+    ProcessBusEvents(*worker);
     auto ev = worker->reader->Next();
     if (!ev) break;
 
@@ -146,7 +148,7 @@ void RunCore(CoreWorker* worker) {
       HandleRead(*worker, line_addr);
     }
   }
-  DrainBusMessages(*worker);
+  ProcessBusEvents(*worker);
 }
 
 void PrintUsage() {
