@@ -21,8 +21,8 @@ Either by using the traces we have processed or by downloading the original trac
 ### 2. Compile
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -pedantic \
-    -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp \
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
+    -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp src/bus.cpp \
     -o baseline
 ```
 
@@ -38,16 +38,25 @@ Multiple cores:
 ./baseline dataset/data/MT{0,1,2,3}-canneal
 ```
 
+## Cache Configuration
+
+The simulator models private L1 caches with the following parameters:
+- 64-byte cache lines (addresses normalized to line granularity)
+- 32 KB capacity per core, implemented as 64 sets with 8-way associativity
+- True LRU replacement within each set
+- MSI coherence maintained via a snoopy bus protocol
+- All caches are L1 only; there is no shared lower-level cache
+
 ## Code Structure
 
 ### `src/main.cpp`
-- Parses command-line arguments
-- Creates streaming trace readers for each core
-- Merges all events in timestamp order using global priority queue
-- Processes events sequentially through cache simulator
+- Parses command-line arguments and builds a trace reader per requested core
+- Registers every core with the global snoopy bus and spawns one worker thread per core
+- Each worker thread processes its own trace stream, drives its private cache, and consumes bus events
+- Global hit/miss statistics are aggregated after all workers finish
 
 ### `src/trace_reader.cpp`
-- Parses timestamped trace files
+- Memory-maps trace files for zero-copy parsing and guarantees safe unmapping
 - Auto-detects and handles different address formats (hex/decimal)
 - Yields events one-by-one
 
@@ -55,4 +64,7 @@ Multiple cores:
 - Implements MSI cache coherence protocol
 - Maintains cache line states: Invalid, Shared, Modified
 - Tracks per-core hit/miss statistics
-- Processes read/write operations and state transitions
+
+### `src/bus.cpp`
+- Implements the global lock-free ring buffer used to broadcast snoopy events
+- Each broadcast reserves a slot via an atomic tail pointer; subscribers track their own read indices

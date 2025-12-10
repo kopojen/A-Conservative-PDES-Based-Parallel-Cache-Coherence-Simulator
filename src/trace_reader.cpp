@@ -5,11 +5,14 @@
 
 #include "trace_reader.h"
 
-#include <charconv>
-#include <cstdlib>
-#include <iostream>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -31,24 +34,89 @@ uint64_t ParseUint64(const std::string& token) {
 
 }  // namespace
 
-TraceReader::TraceReader(const std::filesystem::path& path,
-                         uint32_t default_core_id)
-    : path_(path), default_core_id_(default_core_id) {
-  stream_ = std::make_unique<std::ifstream>(path);
-  if (!stream_ || !stream_->is_open()) {
-    throw std::runtime_error("Failed to open trace file: " + path.string());
+void TraceReader::MmapDeleter::operator()(const char* data) const {
+  if (data && length > 0) {
+    munmap(const_cast<char*>(data), length);
   }
 }
 
-TraceReader::~TraceReader() = default;
+TraceReader::TraceReader(const std::filesystem::path& path,
+                         uint32_t default_core_id)
+    : path_(path), default_core_id_(default_core_id) {
+  fd_ = ::open(path_.c_str(), O_RDONLY);
+  if (fd_ < 0) {
+    throw std::runtime_error("Failed to open trace file " + path_.string() +
+                             ": " + std::strerror(errno));
+  }
+
+  struct stat st;
+  if (fstat(fd_, &st) != 0) {
+    int err = errno;
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error("Failed to stat trace file " + path_.string() +
+                             ": " + std::strerror(err));
+  }
+
+  if (st.st_size == 0) {
+    length_ = 0;
+    return;
+  }
+
+  length_ = static_cast<size_t>(st.st_size);
+  void* mapping = mmap(nullptr, length_, PROT_READ, MAP_PRIVATE, fd_, 0);
+  if (mapping == MAP_FAILED) {
+    int err = errno;
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error("Failed to mmap trace file " + path_.string() +
+                             ": " + std::strerror(err));
+  }
+
+  mapping_ = MappingPtr(static_cast<const char*>(mapping), MmapDeleter{length_});
+}
+
+TraceReader::~TraceReader() {
+  mapping_.reset();
+  if (fd_ >= 0) {
+    ::close(fd_);
+    fd_ = -1;
+  }
+}
 
 std::optional<TraceEvent> TraceReader::Next() {
-  if (!stream_ || !(*stream_)) {
+  if (length_ == 0 || offset_ >= length_ || !mapping_) {
     return std::nullopt;
   }
 
-  std::string line;
-  while (std::getline(*stream_, line)) {
+  while (offset_ < length_) {
+    const char* data = mapping_.get();
+    const size_t line_start = offset_;
+    while (offset_ < length_) {
+      char c = data[offset_];
+      if (c == '\n' || c == '\r') {
+        break;
+      }
+      offset_++;
+    }
+
+    size_t line_len = offset_ - line_start;
+    if (offset_ < length_) {
+      if (data[offset_] == '\r') {
+        offset_++;
+        if (offset_ < length_ && data[offset_] == '\n') {
+          offset_++;
+        }
+      } else if (data[offset_] == '\n') {
+        offset_++;
+      }
+    }
+
+    if (line_len == 0) {
+      continue;
+    }
+
+    std::string line(data + line_start, line_len);
     if (line.empty()) continue;
 
     // Tokenize line

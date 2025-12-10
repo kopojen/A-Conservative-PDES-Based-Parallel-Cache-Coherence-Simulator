@@ -1,104 +1,135 @@
 /**
  * @file msi_cache.cpp
- * @brief MSI cache coherence protocol simulator.
+ * @brief Private cache + snoopy MSI controller implementation.
  */
 
 #include "msi_cache.h"
+
 #include <stdexcept>
 
-MSICache::MSICache(uint32_t num_cores) : num_cores_(num_cores) {
-  if (num_cores_ == 0) {
-    throw std::invalid_argument("num_cores must be > 0");
-  }
-  stats_.resize(num_cores_);
+namespace {
+
+constexpr bool IsPowerOfTwo(uint64_t value) {
+  return value != 0 && (value & (value - 1)) == 0;
 }
 
-void MSICache::Process(const TraceEvent& ev) {
-  if (ev.core_id >= num_cores_) {
-    throw std::runtime_error("core_id out of range: " +
-                             std::to_string(ev.core_id));
+}  // namespace
+
+MSICache::MSICache(uint32_t core_id, size_t cache_size_bytes,
+                   size_t line_size_bytes, size_t associativity)
+    : associativity_(associativity), core_id_(core_id) {
+  if (line_size_bytes == 0 || !IsPowerOfTwo(line_size_bytes)) {
+    throw std::invalid_argument("line_size must be a power-of-two > 0");
+  }
+  if (cache_size_bytes == 0 || cache_size_bytes < line_size_bytes ||
+      (cache_size_bytes % line_size_bytes) != 0) {
+    throw std::invalid_argument("cache_size must be >= line_size and aligned");
+  }
+  if (associativity_ == 0) {
+    throw std::invalid_argument("associativity must be > 0");
   }
 
-  LineInfo& line = lines_[ev.address];
-  if (ev.is_write) {
-    stats_[ev.core_id].writes++;
-    ProcessWrite(ev, line);
+  const size_t num_lines = cache_size_bytes / line_size_bytes;
+  if ((num_lines % associativity_) != 0) {
+    throw std::invalid_argument(
+        "cache_size/line_size must be divisible by associativity");
+  }
+
+  num_sets_ = static_cast<uint32_t>(num_lines / associativity_);
+  if (num_sets_ == 0) {
+    throw std::invalid_argument("number of sets must be >= 1");
+  }
+
+  line_size_shift_ = 0;
+  uint64_t size = line_size_bytes;
+  while ((1ull << line_size_shift_) < size) {
+    ++line_size_shift_;
+  }
+
+  lru_per_set_.resize(num_sets_);
+}
+
+MSICache::State MSICache::GetState(uint64_t line_addr) const {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
+    return State::Invalid;
+  }
+  return it->second.state;
+}
+
+void MSICache::Touch(uint64_t line_addr) {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
+    return;
+  }
+  auto& lru_list = lru_per_set_[it->second.set_idx];
+  lru_list.splice(lru_list.begin(), lru_list, it->second.lru_pos);
+}
+
+void MSICache::InsertOrUpdate(uint64_t line_addr, State state) {
+  auto it = lines_.find(line_addr);
+  if (it != lines_.end()) {
+    it->second.state = state;
+    Touch(line_addr);
+    return;
+  }
+
+  uint32_t set_idx = ComputeSetIndex(line_addr);
+  EvictIfNecessary(set_idx);
+  auto& lru_list = lru_per_set_[set_idx];
+  lru_list.push_front(line_addr);
+
+  LineInfo li;
+  li.state = state;
+  li.set_idx = set_idx;
+  li.lru_pos = lru_list.begin();
+  lines_.emplace(line_addr, std::move(li));
+}
+
+void MSICache::SetState(uint64_t line_addr, State state) {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
+    InsertOrUpdate(line_addr, state);
   } else {
-    stats_[ev.core_id].reads++;
-    ProcessRead(ev, line);
+    it->second.state = state;
   }
 }
 
-void MSICache::ProcessRead(const TraceEvent& ev, LineInfo& line) {
-  auto& s = stats_[ev.core_id];
-  int core = static_cast<int>(ev.core_id);
+void MSICache::Invalidate(uint64_t line_addr) {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
+    return;
+  }
+  auto& lru_list = lru_per_set_[it->second.set_idx];
+  lru_list.erase(it->second.lru_pos);
+  lines_.erase(it);
+}
 
-  switch (line.state) {
-    case State::Invalid:
-      // I → S: fetch from memory
-      s.misses++;
-      line.state = State::Shared;
-      line.sharers = {core};
-      line.owner = -1;
-      break;
+uint32_t MSICache::ComputeSetIndex(uint64_t line_addr) const {
+  uint64_t idx = (line_addr >> line_size_shift_) % num_sets_;
+  return static_cast<uint32_t>(idx);
+}
 
-    case State::Shared:
-      // S → S: hit if already sharer, miss otherwise
-      if (line.sharers.find(core) != line.sharers.end()) {
-        s.hits++;
-      } else {
-        s.misses++;
-        line.sharers.insert(core);
-      }
-      break;
+void MSICache::EvictIfNecessary(uint32_t set_idx) {
+  auto& lru_list = lru_per_set_[set_idx];
+  if (lru_list.size() < associativity_) {
+    return;
+  }
+  uint64_t victim = lru_list.back();
+  lru_list.pop_back();
+  lines_.erase(victim);
+}
 
-    case State::Modified:
-      // M → ? depending on owner
-      if (line.owner == core) {
-        s.hits++;  // M → M (owner reads own data)
-      } else {
-        // M → S: non-owner reads modified data (requires writeback)
-        s.misses++;
-        line.state = State::Shared;
-        line.sharers.clear();
-        line.sharers.insert(line.owner);
-        line.sharers.insert(core);
-        line.owner = -1;
-      }
-      break;
+void MSICache::HandleExternalReadMiss(uint64_t line_addr) {
+  auto it = lines_.find(line_addr);
+  if (it == lines_.end()) {
+    return;
+  }
+  if (it->second.state == State::Modified) {
+    it->second.state = State::Shared;
   }
 }
 
-void MSICache::ProcessWrite(const TraceEvent& ev, LineInfo& line) {
-  auto& s = stats_[ev.core_id];
-  int core = static_cast<int>(ev.core_id);
-
-  switch (line.state) {
-    case State::Invalid:
-      // I → M: acquire exclusive ownership
-      s.misses++;
-      line.state = State::Modified;
-      line.owner = core;
-      line.sharers.clear();
-      break;
-
-    case State::Shared:
-      // S → M: upgrade (invalidate other sharers)
-      s.misses++;
-      line.state = State::Modified;
-      line.owner = core;
-      line.sharers.clear();
-      break;
-
-    case State::Modified:
-      // M → M depending on owner
-      if (line.owner == core) {
-        s.hits++;  // M → M (owner writes own data)
-      } else {
-        // M → M: non-owner writes (ownership transfer)
-        s.misses++;
-        line.owner = core;
-      }
-      break;
-  }
+void MSICache::HandleExternalWriteMiss(uint64_t line_addr) {
+  Invalidate(line_addr);
 }

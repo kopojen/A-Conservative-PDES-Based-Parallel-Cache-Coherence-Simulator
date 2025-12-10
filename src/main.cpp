@@ -8,40 +8,148 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <queue>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <thread>
 #include <vector>
 
+#include "bus.h"
 #include "msi_cache.h"
 #include "trace_reader.h"
 
 namespace {
 
-struct ScheduledEvent {
-  TraceEvent ev;
-  size_t stream_index{};
-};
-
-struct EventEarlier {
-  bool operator()(const ScheduledEvent& a, const ScheduledEvent& b) const {
-    if (a.ev.timestamp != b.ev.timestamp) {
-      return a.ev.timestamp > b.ev.timestamp;
-    }
-    return a.ev.core_id > b.ev.core_id;
-  }
-};
-
 struct CoreStream {
   uint32_t core_id{};
   std::unique_ptr<TraceReader> reader;
 };
+
+std::atomic<bool> g_stop_requested{false};
+volatile std::sig_atomic_t g_signal_flag = 0;
+
+constexpr uint64_t kLineSizeBytes = 64;
+constexpr uint64_t kCacheSizeBytes = 32 * 1024;
+constexpr uint32_t kAssociativity = 8;
+
+uint64_t NormalizeAddress(uint64_t addr) {
+  return addr & ~(kLineSizeBytes - 1);
+}
+
+struct CoreWorker {
+  CoreWorker(uint32_t id, std::unique_ptr<TraceReader> reader_ptr, Bus& bus_ref,
+             CoreStats& stats_ref)
+      : core_id(id),
+        reader(std::move(reader_ptr)),
+        cache(id, kCacheSizeBytes, kLineSizeBytes, kAssociativity),
+        stats(&stats_ref),
+        bus(&bus_ref),
+        subscription(bus->RegisterSubscription(core_id)) {}
+
+  uint32_t core_id{0};
+  std::unique_ptr<TraceReader> reader;
+  MSICache cache;
+  CoreStats* stats{nullptr};
+  Bus* bus{nullptr};
+  BusSubscription subscription;
+  std::thread thread;
+};
+
+bool StopRequested() {
+  if (g_signal_flag != 0) {
+    g_stop_requested.store(true, std::memory_order_relaxed);
+  }
+  return g_stop_requested.load(std::memory_order_relaxed);
+}
+
+void HandleSignal(int) {
+  g_signal_flag = 1;
+}
+
+void InstallSignalHandlers() {
+  std::signal(SIGINT, HandleSignal);
+  std::signal(SIGTERM, HandleSignal);
+}
+
+void ProcessBusEvents(CoreWorker& worker) {
+  BusMessage msg;
+  while (worker.subscription.Next(msg)) {
+    if (msg.source_core == worker.core_id) {
+      continue;
+    }
+    if (msg.type == BusMessageType::ReadMiss) {
+      worker.cache.HandleExternalReadMiss(msg.line_addr);
+    } else {
+      worker.cache.HandleExternalWriteMiss(msg.line_addr);
+    }
+  }
+}
+
+void HandleRead(CoreWorker& worker, uint64_t line_addr) {
+  auto& stats = *worker.stats;
+  const auto state = worker.cache.GetState(line_addr);
+
+  if (state == MSICache::State::Shared ||
+      state == MSICache::State::Modified) {
+    stats.hits++;
+    worker.cache.Touch(line_addr);
+    return;
+  }
+
+  stats.misses++;
+  BusMessage msg{BusMessageType::ReadMiss, worker.core_id, line_addr};
+  worker.bus->Broadcast(msg);
+  worker.cache.InsertOrUpdate(line_addr, MSICache::State::Shared);
+}
+
+void HandleWrite(CoreWorker& worker, uint64_t line_addr) {
+  auto& stats = *worker.stats;
+  const auto state = worker.cache.GetState(line_addr);
+
+  if (state == MSICache::State::Modified) {
+    stats.hits++;
+    worker.cache.Touch(line_addr);
+    return;
+  }
+
+  stats.misses++;
+  BusMessage msg{BusMessageType::WriteMiss, worker.core_id, line_addr};
+  worker.bus->Broadcast(msg);
+
+  if (state == MSICache::State::Shared) {
+    worker.cache.SetState(line_addr, MSICache::State::Modified);
+    worker.cache.Touch(line_addr);
+  } else {
+    worker.cache.InsertOrUpdate(line_addr, MSICache::State::Modified);
+  }
+}
+
+void RunCore(CoreWorker* worker) {
+  if (!worker) return;
+  while (!StopRequested()) {
+    ProcessBusEvents(*worker);
+    auto ev = worker->reader->Next();
+    if (!ev) break;
+
+    ev->core_id = worker->core_id;
+    const uint64_t line_addr = NormalizeAddress(ev->address);
+
+    if (ev->is_write) {
+      worker->stats->writes++;
+      HandleWrite(*worker, line_addr);
+    } else {
+      worker->stats->reads++;
+      HandleRead(*worker, line_addr);
+    }
+  }
+  ProcessBusEvents(*worker);
+}
 
 void PrintUsage() {
   std::cout << "Usage: baseline [--trace CORE_ID:PATH | PATH]...\n"
@@ -105,6 +213,8 @@ int main(int argc, char* argv[]) {
     const auto specs = CollectTraceSpecs(argc, argv);
     auto streams = BuildStreams(specs);
 
+    InstallSignalHandlers();
+
     uint32_t max_core_id = 0;
     for (const auto& s : streams) {
       max_core_id = std::max(max_core_id, s.core_id);
@@ -116,45 +226,50 @@ int main(int argc, char* argv[]) {
     std::cout << "Trace files: " << streams.size() << "\n";
     std::cout << "Starting simulation...\n\n";
 
-    MSICache cache(num_cores);
+    Bus bus(num_cores);
+    std::vector<CoreStats> stats(num_cores);
+    std::vector<std::unique_ptr<TraceReader>> readers(num_cores);
 
-    std::priority_queue<ScheduledEvent, std::vector<ScheduledEvent>,
-                        EventEarlier>
-        queue;
+    for (auto& stream : streams) {
+      if (stream.core_id >= num_cores) {
+        throw std::runtime_error("core_id out of range when assigning readers");
+      }
+      if (readers[stream.core_id]) {
+        throw std::runtime_error("Multiple traces assigned to core " +
+                                 std::to_string(stream.core_id));
+      }
+      readers[stream.core_id] = std::move(stream.reader);
+    }
 
-    // Seed queue with first event from each stream
-    for (size_t i = 0; i < streams.size(); ++i) {
-      if (auto ev = streams[i].reader->Next()) {
-        ev->core_id = streams[i].core_id;
-        ScheduledEvent se;
-        se.ev = *ev;
-        se.stream_index = i;
-        queue.push(se);
+    std::vector<std::unique_ptr<CoreWorker>> workers;
+    workers.reserve(num_cores);
+
+    for (uint32_t core = 0; core < num_cores; ++core) {
+      if (!readers[core]) {
+        throw std::runtime_error("Missing trace for core " +
+                                 std::to_string(core));
+      }
+
+      auto worker = std::make_unique<CoreWorker>(core, std::move(readers[core]),
+                                                 bus, stats[core]);
+      worker->thread = std::thread(RunCore, worker.get());
+      workers.push_back(std::move(worker));
+    }
+
+    for (auto& worker : workers) {
+      if (worker->thread.joinable()) {
+        worker->thread.join();
       }
     }
 
-    // Process events in timestamp order
     uint64_t processed = 0;
-    while (!queue.empty()) {
-      ScheduledEvent cur = queue.top();
-      queue.pop();
-      cache.Process(cur.ev);
-      processed++;
-
-      if (auto next = streams[cur.stream_index].reader->Next()) {
-        next->core_id = streams[cur.stream_index].core_id;
-        ScheduledEvent se;
-        se.ev = *next;
-        se.stream_index = cur.stream_index;
-        queue.push(se);
-      }
+    for (const auto& s : stats) {
+      processed += s.reads + s.writes;
     }
 
-    // Output results
     std::cout << "=== Simulation Complete ===\n";
     std::cout << "Total events processed: " << processed << "\n\n";
 
-    const auto& stats = cache.stats();
     uint64_t total_accesses = 0;
     uint64_t total_hits = 0;
 

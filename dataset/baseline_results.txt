@@ -1,0 +1,37 @@
+=== Baseline Sequential Simulator ===
+Cores: 4
+Trace files: 4
+Starting simulation...
+
+=== Simulation Complete ===
+Total events processed: 41988739
+
+Core 0:
+  Reads  : 7394733
+  Writes : 3438117
+  Hits   : 80744
+  Misses : 10752106
+  Hit Rate: 0.75%
+
+Core 1:
+  Reads  : 7085879
+  Writes : 3292632
+  Hits   : 79994
+  Misses : 10298517
+  Hit Rate: 0.77%
+
+Core 2:
+  Reads  : 7101376
+  Writes : 3302707
+  Hits   : 79622
+  Misses : 10324461
+  Hit Rate: 0.77%
+
+Core 3:
+  Reads  : 7080996
+  Writes : 3292299
+  Hits   : 79713
+  Misses : 10293582
+  Hit Rate: 0.77%
+
+Overall Hit Rate: 0.76%
