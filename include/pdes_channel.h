@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <vector>
@@ -108,9 +109,10 @@ private:
   /// Lower bound from each source channel (from null messages)
   std::vector<std::atomic<uint64_t>> channel_lb_;
 
-  /// Track minimum real message timestamp per source in the heap
-  /// (Updated when pushing/popping)
-  std::vector<uint64_t> min_real_ts_per_src_;
+  /// Per-source multimap to efficiently track messages by timestamp
+  /// Key: timestamp, Value: message
+  /// This allows O(log n) insertion and O(1) minimum lookup per source
+  std::vector<std::multimap<uint64_t, PdesMsg>> per_source_msgs_;
 
   uint32_t num_cores_{0};
 };

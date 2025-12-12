@@ -13,8 +13,7 @@
 // ============================================================================
 
 PdesInbox::PdesInbox(uint32_t num_cores)
-    : channel_lb_(num_cores),
-      min_real_ts_per_src_(num_cores, kTimestampInfinity),
+    : channel_lb_(num_cores), per_source_msgs_(num_cores),
       num_cores_(num_cores) {
   // Initialize all channel lower bounds to 0 (unknown)
   for (uint32_t i = 0; i < num_cores; ++i) {
@@ -31,15 +30,13 @@ void PdesInbox::Push(const PdesMsg &msg) {
     return;
   }
 
-  // Real message: add to heap
+  // Real message: add to heap and per-source map
   {
     std::lock_guard<std::mutex> lock(mutex_);
     heap_.push(msg);
 
-    // Update min real timestamp for this source
-    if (msg.ts < min_real_ts_per_src_[msg.src]) {
-      min_real_ts_per_src_[msg.src] = msg.ts;
-    }
+    // Add to per-source multimap for efficient min tracking
+    per_source_msgs_[msg.src].emplace(msg.ts, msg);
   }
   cv_.notify_all();
 }
@@ -59,19 +56,16 @@ bool PdesInbox::TryPop(PdesMsg &msg, uint64_t safe_time) {
   msg = top;
   heap_.pop();
 
-  // Recalculate min real timestamp for this source
-  // (This is O(n) but we can optimize later if needed)
-  min_real_ts_per_src_[msg.src] = kTimestampInfinity;
-
-  // We need to scan the heap to find the new minimum for this source
-  // Create a temporary copy to scan
-  auto heap_copy = heap_;
-  while (!heap_copy.empty()) {
-    const PdesMsg &m = heap_copy.top();
-    if (m.src == msg.src && m.ts < min_real_ts_per_src_[msg.src]) {
-      min_real_ts_per_src_[msg.src] = m.ts;
+  // Remove from per-source map - O(log n) operation
+  auto &src_map = per_source_msgs_[msg.src];
+  auto range = src_map.equal_range(msg.ts);
+  for (auto it = range.first; it != range.second; ++it) {
+    // Find the exact message by comparing all fields
+    if (it->second.kind == msg.kind && it->second.src == msg.src &&
+        it->second.dst == msg.dst && it->second.line_addr == msg.line_addr) {
+      src_map.erase(it);
+      break;
     }
-    heap_copy.pop();
   }
 
   return true;
@@ -112,7 +106,14 @@ uint64_t PdesInbox::ComputeSafeTime(uint32_t self_core) const {
 
     // cmin[src] = min(qmin[src], lb[src])
     uint64_t lb = channel_lb_[src].load(std::memory_order_acquire);
-    uint64_t qmin = min_real_ts_per_src_[src];
+
+    // Get minimum timestamp from per-source map - O(1) operation
+    uint64_t qmin = kTimestampInfinity;
+    const auto &src_map = per_source_msgs_[src];
+    if (!src_map.empty()) {
+      qmin = src_map.begin()->first; // First element has minimum timestamp
+    }
+
     uint64_t cmin = std::min(lb, qmin);
 
     if (cmin < safe_time) {
@@ -130,7 +131,11 @@ bool PdesInbox::Empty() const {
 
 uint64_t PdesInbox::GetMinRealMsgTimestamp(uint32_t src) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return min_real_ts_per_src_[src];
+  const auto &src_map = per_source_msgs_[src];
+  if (src_map.empty()) {
+    return kTimestampInfinity;
+  }
+  return src_map.begin()->first; // O(1) - first element has minimum timestamp
 }
 
 void PdesInbox::WaitForMessage() {
