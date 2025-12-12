@@ -84,7 +84,30 @@ TraceReader::~TraceReader() {
   }
 }
 
+std::optional<TraceEvent> TraceReader::Peek() {
+  if (has_peeked_) {
+    return peeked_event_;
+  }
+
+  peeked_event_ = ReadNextEvent();
+  has_peeked_ = true;
+  return peeked_event_;
+}
+
+bool TraceReader::HasNext() { return Peek().has_value(); }
+
 std::optional<TraceEvent> TraceReader::Next() {
+  if (has_peeked_) {
+    has_peeked_ = false;
+    auto result = std::move(peeked_event_);
+    peeked_event_.reset();
+    return result;
+  }
+
+  return ReadNextEvent();
+}
+
+std::optional<TraceEvent> TraceReader::ReadNextEvent() {
   if (length_ == 0 || offset_ >= length_ || !mapping_) {
     return std::nullopt;
   }
