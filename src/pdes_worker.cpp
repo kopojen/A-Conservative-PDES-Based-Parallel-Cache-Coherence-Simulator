@@ -37,35 +37,35 @@ void PdesWorker::Initialize() {
 
     // Publish initial lower bound: "I won't send anything before t0 +
     // bus_latency"
-    uint64_t initial_lb = next_local_ts_ + kBusLatency;
-    channel_mgr_->UpdateLowerBound(core_id_, initial_lb);
-    last_lb_published_ = initial_lb;
+    UpdateLowerBoundCandidate();
+    MaybePublishLowerBound(true);
   } else {
     // No events in trace - publish infinity
     has_next_local_ = false;
     trace_exhausted_ = true;
-    channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
-    last_lb_published_ = kTimestampInfinity;
+    UpdateLowerBoundCandidate();
+    MaybePublishLowerBound(true);
   }
 }
 
-void PdesWorker::PublishLowerBound() {
-  uint64_t lb;
+void PdesWorker::MaybePublishLowerBound(bool force) {
+  if (!lb_dirty_ && !force) {
+    return;
+  }
+  if (force || pending_lb_ > last_lb_published_) {
+    channel_mgr_->UpdateLowerBound(core_id_, pending_lb_);
+    last_lb_published_ = pending_lb_;
+    lb_dirty_ = false;
+  }
+}
 
+void PdesWorker::UpdateLowerBoundCandidate() {
   if (has_next_local_) {
-    // Next real message can only be sent when we process next_local_ts
-    // So others won't see anything before next_local_ts + bus_latency
-    lb = next_local_ts_ + kBusLatency;
+    pending_lb_ = next_local_ts_ + kBusLatency;
   } else {
-    // Trace exhausted - we won't send any more real messages
-    lb = kTimestampInfinity;
+    pending_lb_ = kTimestampInfinity;
   }
-
-  // Only send if it advances the lower bound
-  if (lb > last_lb_published_) {
-    channel_mgr_->UpdateLowerBound(core_id_, lb);
-    last_lb_published_ = lb;
-  }
+  lb_dirty_ = pending_lb_ > last_lb_published_;
 }
 
 void PdesWorker::HandleRead(uint64_t line_addr) {
@@ -198,8 +198,8 @@ void PdesWorker::Run() {
       if (!trace_exhausted_) {
         trace_exhausted_ = true;
         // Publish final lower bound
-        channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
-        last_lb_published_ = kTimestampInfinity;
+        UpdateLowerBoundCandidate();
+        MaybePublishLowerBound(true);
       }
       if (!done_signaled_) {
         done_signaled_ = true;
@@ -250,8 +250,9 @@ void PdesWorker::Run() {
             has_next_local_ = false;
           }
 
-          // Publish lower bound to advance lower bounds
-          PublishLowerBound();
+          // Update lower bound candidate and publish only if it advanced
+          UpdateLowerBoundCandidate();
+          MaybePublishLowerBound();
         }
       } else {
         // Cannot safely process a local event at the boundary (t_local ==
@@ -259,7 +260,7 @@ void PdesWorker::Run() {
         // becomes visible or all sources advance their lower bounds past t.
         stuck_iterations_++;
         CheckStuck();
-        PublishLowerBound();
+        MaybePublishLowerBound();
         inbox.WaitForMessage();
       }
     } else {
@@ -268,7 +269,7 @@ void PdesWorker::Run() {
       CheckStuck();
 
       // Publish lower bound to help other cores make progress
-      PublishLowerBound();
+      MaybePublishLowerBound();
 
       // Brief wait to avoid busy spinning
       inbox.WaitForMessage();
@@ -280,7 +281,8 @@ void PdesWorker::Run() {
     done_signaled_ = true;
     if (!trace_exhausted_) {
       trace_exhausted_ = true;
-      channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
+      UpdateLowerBoundCandidate();
+      MaybePublishLowerBound(true);
     }
     done_count_->fetch_add(1, std::memory_order_release);
   }

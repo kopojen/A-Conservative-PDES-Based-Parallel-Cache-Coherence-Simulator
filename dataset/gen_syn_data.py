@@ -38,7 +38,7 @@ def clamp_align(addr: int, low: int, high: int, align: int = 64) -> int:
 
 def main(
     seed: int = 1234,
-    num_cores: int = 16,
+    num_cores: int = 32,
     t_max: int = 700000,
     target_accesses_per_core: int = 100000,
     out_prefix: str = "core",

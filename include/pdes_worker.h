@@ -77,7 +77,8 @@ private:
   void HandleWrite(uint64_t line_addr);
 
   /// Publish lower bound for this source (replaces null messages)
-  void PublishLowerBound();
+  void MaybePublishLowerBound(bool force = false);
+  void UpdateLowerBoundCandidate();
 
   /// Normalize address to cache line
   static uint64_t NormalizeAddress(uint64_t addr);
@@ -107,6 +108,8 @@ private:
   uint64_t next_local_ts_{0};     // Timestamp of next local event
   bool has_next_local_{false};    // Whether there's a next local event
   uint64_t last_lb_published_{0}; // Last lower bound published
+  uint64_t pending_lb_{0};        // Candidate lower bound to publish
+  bool lb_dirty_{false};          // Whether pending_lb_ needs publishing
   uint64_t last_msg_received_{0}; // Last message received timestamp
   uint64_t stuck_iterations_{0};  // Counter for stuck detection
   bool trace_exhausted_{false};   // Whether trace has been fully processed

@@ -61,8 +61,7 @@ uint64_t PdesRing::PublishedSeq() const {
 
 PdesInbox::PdesInbox(uint32_t self_core,
                      const std::vector<std::unique_ptr<PdesRing>> &rings,
-                     const std::vector<std::unique_ptr<std::atomic<uint64_t>>>
-                         &channel_lb)
+                     const std::vector<ChannelLowerBound> &channel_lb)
     : rings_(&rings), channel_lb_(&channel_lb), num_cores_(rings.size()),
       self_core_(self_core) {
   read_seq_.assign(num_cores_, 0);
@@ -101,7 +100,7 @@ uint64_t PdesInbox::PeekMinTimestamp() const {
 }
 
 uint64_t PdesInbox::GetChannelLowerBound(uint32_t src) const {
-  return channel_lb_->at(src)->load(std::memory_order_acquire);
+  return channel_lb_->at(src).value.load(std::memory_order_acquire);
 }
 
 PdesInbox::ScanResult PdesInbox::Scan(uint32_t self_core) const {
@@ -112,7 +111,7 @@ PdesInbox::ScanResult PdesInbox::Scan(uint32_t self_core) const {
       continue;
     }
 
-    uint64_t lb = channel_lb_->at(src)->load(std::memory_order_acquire);
+    uint64_t lb = channel_lb_->at(src).value.load(std::memory_order_acquire);
     uint64_t qmin = NextTimestampFrom(src);
     uint64_t cmin = std::min(lb, qmin);
 
@@ -137,7 +136,7 @@ uint64_t PdesInbox::ComputeSafeTime(uint32_t self_core) const {
       continue;
     }
 
-    uint64_t lb = channel_lb_->at(src)->load(std::memory_order_acquire);
+    uint64_t lb = channel_lb_->at(src).value.load(std::memory_order_acquire);
     uint64_t qmin = NextTimestampFrom(src);
     uint64_t cmin = std::min(lb, qmin);
 
@@ -234,7 +233,7 @@ PdesChannelManager::PdesChannelManager(uint32_t num_cores)
 
   for (uint32_t i = 0; i < num_cores; ++i) {
     rings_.push_back(std::make_unique<PdesRing>());
-    channel_lb_.push_back(std::make_unique<std::atomic<uint64_t>>(0));
+    channel_lb_.push_back(ChannelLowerBound{});
   }
 
   for (uint32_t i = 0; i < num_cores; ++i) {
@@ -255,5 +254,5 @@ void PdesChannelManager::AppendReal(uint32_t src_core, uint64_t arrival_time,
 void PdesChannelManager::UpdateLowerBound(uint32_t src_core, uint64_t lb) {
   // Single-writer per entry (each core only updates its own lb), so a simple
   // store is sufficient and avoids CAS traffic.
-  channel_lb_[src_core]->store(lb, std::memory_order_release);
+  channel_lb_[src_core].value.store(lb, std::memory_order_release);
 }

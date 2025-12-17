@@ -11,6 +11,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -24,6 +25,28 @@ constexpr uint64_t kBusLatency = 1;
 
 /// Sentinel value for "no timestamp" / infinity
 constexpr uint64_t kTimestampInfinity = std::numeric_limits<uint64_t>::max();
+
+/// Per-core lower bound with padding to avoid cache line sharing.
+struct alignas(64) ChannelLowerBound {
+  static constexpr size_t kPaddingBytes = 64 - sizeof(std::atomic<uint64_t>);
+  std::atomic<uint64_t> value{0};
+  uint8_t padding[kPaddingBytes]{};
+
+  ChannelLowerBound() = default;
+  ChannelLowerBound(const ChannelLowerBound &) = delete;
+  ChannelLowerBound &operator=(const ChannelLowerBound &) = delete;
+  ChannelLowerBound(ChannelLowerBound &&other) noexcept {
+    value.store(other.value.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+  }
+  ChannelLowerBound &operator=(ChannelLowerBound &&other) noexcept {
+    value.store(other.value.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+    return *this;
+  }
+};
+static_assert(sizeof(ChannelLowerBound) == 64,
+              "ChannelLowerBound must fill a cache line");
 
 /**
  * @brief Message kind for PDES communication.
@@ -93,8 +116,7 @@ class PdesInbox {
 public:
   PdesInbox(uint32_t self_core,
             const std::vector<std::unique_ptr<PdesRing>> &rings,
-            const std::vector<std::unique_ptr<std::atomic<uint64_t>>>
-                &channel_lb);
+            const std::vector<ChannelLowerBound> &channel_lb);
 
   /// Try to pop the earliest readable message (non-blocking)
   bool TryPop(PdesMsg &msg, uint64_t safe_time);
@@ -133,8 +155,7 @@ private:
   uint64_t NextTimestampFrom(uint32_t src) const;
 
   const std::vector<std::unique_ptr<PdesRing>> *rings_{nullptr};
-  const std::vector<std::unique_ptr<std::atomic<uint64_t>>> *channel_lb_{
-      nullptr};
+  const std::vector<ChannelLowerBound> *channel_lb_{nullptr};
   std::vector<uint64_t> read_seq_;
   uint32_t num_cores_{0};
   uint32_t self_core_{0};
@@ -169,5 +190,5 @@ private:
   uint32_t num_cores_{0};
   std::vector<std::unique_ptr<PdesInbox>> inboxes_;
   std::vector<std::unique_ptr<PdesRing>> rings_;
-  std::vector<std::unique_ptr<std::atomic<uint64_t>>> channel_lb_;
+  std::vector<ChannelLowerBound> channel_lb_;
 };
