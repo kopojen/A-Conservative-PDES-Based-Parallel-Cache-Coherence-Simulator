@@ -69,8 +69,16 @@ PdesInbox::PdesInbox(uint32_t self_core,
 }
 
 uint64_t PdesInbox::NextTimestampFrom(uint32_t src) const {
+  // Fast path: if the source hasn't published anything beyond our read pointer,
+  // we know there is no readable message without touching the ring slots.
+  const auto &ring = *rings_->at(src);
+  const uint64_t published = ring.PublishedSeq();
+  if (read_seq_[src] >= published) {
+    return kTimestampInfinity;
+  }
+
   PdesMsg tmp;
-  if (rings_->at(src)->Read(read_seq_[src], tmp)) {
+  if (ring.Read(read_seq_[src], tmp)) {
     return tmp.ts;
   }
   return kTimestampInfinity;
@@ -245,13 +253,7 @@ void PdesChannelManager::AppendReal(uint32_t src_core, uint64_t arrival_time,
 }
 
 void PdesChannelManager::UpdateLowerBound(uint32_t src_core, uint64_t lb) {
-  uint64_t current =
-      channel_lb_[src_core]->load(std::memory_order_relaxed);
-  while (lb > current) {
-    if (channel_lb_[src_core]->compare_exchange_weak(
-            current, lb, std::memory_order_release,
-            std::memory_order_relaxed)) {
-      break;
-    }
-  }
+  // Single-writer per entry (each core only updates its own lb), so a simple
+  // store is sufficient and avoids CAS traffic.
+  channel_lb_[src_core]->store(lb, std::memory_order_release);
 }

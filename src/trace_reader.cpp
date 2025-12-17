@@ -5,31 +5,50 @@
 
 #include "trace_reader.h"
 
+#include <charconv>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <vector>
 
 namespace {
 
-// Parse integer token, handling 'Ox' typo (letter O instead of 0)
-uint64_t ParseUint64(const std::string& token) {
-  std::string fixed_token = token;
-  if (token.size() >= 2 && token[0] == 'O' && token[1] == 'x') {
-    fixed_token[0] = '0';  // Fix typo: Ox → 0x
+constexpr bool IsSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Parse integer token, supporting decimal and 0x-prefixed hex.
+// Also handles the common 'Ox' typo (letter O instead of zero).
+uint64_t ParseUint64(std::string_view token) {
+  if (token.empty()) {
+    throw std::runtime_error("Failed to parse integer token: empty");
   }
-  
-  try {
-    return std::stoull(fixed_token, nullptr, 0);
-  } catch (const std::exception& exc) {
-    throw std::runtime_error("Failed to parse integer token '" + token +
-                             "': " + exc.what());
+
+  int base = 10;
+  // Fix 'Ox' -> '0x' without allocating.
+  if (token.size() >= 2 && (token[0] == 'O' || token[0] == 'o') &&
+      (token[1] == 'x' || token[1] == 'X')) {
+    base = 16;
+    token.remove_prefix(2);
+  } else if (token.size() >= 2 && token[0] == '0' &&
+             (token[1] == 'x' || token[1] == 'X')) {
+    base = 16;
+    token.remove_prefix(2);
   }
+
+  uint64_t value = 0;
+  const char *begin = token.data();
+  const char *end = token.data() + token.size();
+  auto res = std::from_chars(begin, end, value, base);
+  if (res.ec != std::errc() || res.ptr != end) {
+    throw std::runtime_error("Failed to parse integer token '" +
+                             std::string(token) + "'");
+  }
+  return value;
 }
 
 }  // namespace
@@ -139,47 +158,71 @@ std::optional<TraceEvent> TraceReader::ReadNextEvent() {
       continue;
     }
 
-    std::string line(data + line_start, line_len);
-    if (line.empty()) continue;
+    const char *line_ptr = data + line_start;
+    const char *begin = line_ptr;
+    const char *end = line_ptr + line_len;
 
-    // Tokenize line
-    std::istringstream iss(line);
-    std::vector<std::string> tokens;
-    std::string tok;
-    while (iss >> tok) {
-      tokens.push_back(tok);
+    auto next_token = [&](std::string_view &out) -> bool {
+      while (begin < end && IsSpace(*begin)) {
+        ++begin;
+      }
+      if (begin >= end) {
+        out = std::string_view{};
+        return false;
+      }
+      const char *tok_begin = begin;
+      while (begin < end && !IsSpace(*begin)) {
+        ++begin;
+      }
+      out = std::string_view(tok_begin, static_cast<size_t>(begin - tok_begin));
+      return true;
+    };
+
+    std::string_view t0, t1, t2, t3, t4;
+    if (!next_token(t0)) {
+      continue;
     }
-
-    if (tokens.size() < 3) {
+    if (!next_token(t1) || !next_token(t2)) {
       throw std::runtime_error("Malformed trace line in " + path_.string() +
-                               ": " + line);
+                               ": " + std::string(std::string_view(line_ptr, line_len)));
     }
+    // Optional fields
+    (void)next_token(t3);
+    (void)next_token(t4);
 
     TraceEvent ev;
-    ev.raw_line = line;
-    ev.timestamp = ParseUint64(tokens[0]);
+    // Avoid copying raw line on the fast path (it is only for debugging).
+    ev.timestamp = ParseUint64(t0);
 
     // Detect format: check if 2nd token is operation (R/W) or core_id
-    std::string second_token = tokens[1];
-    bool second_is_op = (second_token == "R" || second_token == "r" ||
-                         second_token == "W" || second_token == "w");
+    const bool second_is_op =
+        (t1.size() == 1 &&
+         (t1[0] == 'R' || t1[0] == 'r' || t1[0] == 'W' || t1[0] == 'w'));
 
     if (second_is_op) {
       // Format: timestamp op address [pc]
       ev.core_id = default_core_id_;
-      ev.is_write = (second_token == "W" || second_token == "w");
-      ev.address = ParseUint64(tokens[2]);
-      if (tokens.size() >= 4) {
-        ev.pc = ParseUint64(tokens[3]);
+      ev.is_write = (t1[0] == 'W' || t1[0] == 'w');
+      ev.address = ParseUint64(t2);
+      if (!t3.empty()) {
+        ev.pc = ParseUint64(t3);
       }
     } else {
       // Format: timestamp core_id op address [pc]
       file_embeds_core_ = true;
-      ev.core_id = static_cast<uint32_t>(ParseUint64(tokens[1]));
-      ev.is_write = (tokens[2] == "W" || tokens[2] == "w");
-      ev.address = ParseUint64(tokens[3]);
-      if (tokens.size() >= 5) {
-        ev.pc = ParseUint64(tokens[4]);
+      ev.core_id = static_cast<uint32_t>(ParseUint64(t1));
+      if (t2.size() != 1) {
+        throw std::runtime_error("Malformed trace line in " + path_.string() +
+                                 ": invalid op token");
+      }
+      ev.is_write = (t2[0] == 'W' || t2[0] == 'w');
+      if (t3.empty()) {
+        throw std::runtime_error("Malformed trace line in " + path_.string() +
+                                 ": missing address field");
+      }
+      ev.address = ParseUint64(t3);
+      if (!t4.empty()) {
+        ev.pc = ParseUint64(t4);
       }
     }
 
