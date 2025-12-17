@@ -3,21 +3,21 @@
  * @brief Conservative PDES channel with CMB (Chandy-Misra-Bryant) protocol.
  *
  * Implements timestamped LP-to-LP communication with:
- * - Real messages (coherence events)
- * - Null messages (for advancing lower bounds)
+ * - Real messages (coherence events) appended once per source
+ * - Shared lower bounds (replacing null message broadcast)
  * - Safe-time calculation for deadlock-free execution
  */
 
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <limits>
-#include <map>
-#include <mutex>
-#include <queue>
+#include <memory>
+#include <thread>
 #include <vector>
+
+constexpr size_t kRingCapacity = 1ull << 20; // Per-source ring capacity
 
 /// Bus latency in cycles (lookahead > 0 to avoid deadlock)
 constexpr uint64_t kBusLatency = 1;
@@ -60,61 +60,86 @@ struct PdesMsg {
 /**
  * @brief Thread-safe inbox for receiving PDES messages.
  *
- * Uses a min-heap ordered by timestamp. Maintains per-source lower bounds
- * for CMB safe-time calculation.
+ * Implements a lock-free shared broadcast log:
+ * - Each source core owns a single-writer ring buffer.
+ * - All destination cores maintain per-source read pointers.
+ * - Lower bounds are advertised via a shared atomic array (replacing null
+ *   messages).
  */
+class PdesRing {
+public:
+  PdesRing() : capacity_(kRingCapacity), buffer_(capacity_) {}
+
+  void Append(uint64_t ts, PdesMsgKind kind, uint32_t src,
+              uint64_t line_addr);
+  bool Read(uint64_t seq, PdesMsg &msg) const;
+  uint64_t PublishedSeq() const;
+
+private:
+  struct Slot {
+    std::atomic<uint64_t> seq{kTimestampInfinity};
+    PdesMsgKind kind{PdesMsgKind::Null};
+    uint32_t src{0};
+    uint64_t ts{0};
+    uint64_t line_addr{0};
+  };
+
+  size_t capacity_;
+  std::vector<Slot> buffer_;
+  alignas(64) std::atomic<uint64_t> next_seq_{0};
+};
+
 class PdesInbox {
 public:
-  explicit PdesInbox(uint32_t num_cores);
+  PdesInbox(uint32_t self_core,
+            const std::vector<std::unique_ptr<PdesRing>> &rings,
+            const std::vector<std::unique_ptr<std::atomic<uint64_t>>>
+                &channel_lb);
 
-  /// Enqueue a message (thread-safe)
-  void Push(const PdesMsg &msg);
-
-  /// Try to pop the earliest message if safe (non-blocking)
-  /// Returns true if a message was popped
+  /// Try to pop the earliest readable message (non-blocking)
   bool TryPop(PdesMsg &msg, uint64_t safe_time);
 
-  /// Peek at the earliest message timestamp (kTimestampInfinity if empty)
+  /// Try to pop from a specific source (non-blocking, assumes caller picked
+  /// earliest source)
+  bool TryPopFrom(uint32_t src, uint64_t safe_time, PdesMsg &msg);
+
+  struct ScanResult {
+    uint64_t min_ts{kTimestampInfinity};
+    uint32_t min_src{std::numeric_limits<uint32_t>::max()};
+    uint64_t safe_time{kTimestampInfinity};
+  };
+
+  /// Single pass to get earliest inbox ts and safe_time together
+  ScanResult Scan(uint32_t self_core) const;
+
+  /// Peek at the earliest unread remote message timestamp
   uint64_t PeekMinTimestamp() const;
 
   /// Get the lower bound from a specific source channel
   uint64_t GetChannelLowerBound(uint32_t src) const;
 
-  /// Update the lower bound from a source (from null message)
-  void UpdateChannelLowerBound(uint32_t src, uint64_t lb);
-
   /// Compute the CMB safe time: min over all channels of min(qmin, lb)
   uint64_t ComputeSafeTime(uint32_t self_core) const;
 
-  /// Check if inbox is empty
-  bool Empty() const;
-
-  /// Get the minimum real message timestamp from a specific source
+  /// Get the minimum unread real message timestamp from a specific source
   uint64_t GetMinRealMsgTimestamp(uint32_t src) const;
 
-  /// Block until there's a message or condition changes
+  /// Lightweight wait to avoid busy spinning
   void WaitForMessage();
-
-  /// Wake up any waiting threads
-  void NotifyAll();
+  /// Reset adaptive backoff after progress
+  void ResetWaitBackoff();
 
 private:
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
+  uint64_t NextTimestampFrom(uint32_t src) const;
 
-  /// Min-heap of messages ordered by timestamp
-  std::priority_queue<PdesMsg, std::vector<PdesMsg>, std::greater<PdesMsg>>
-      heap_;
-
-  /// Lower bound from each source channel (from null messages)
-  std::vector<std::atomic<uint64_t>> channel_lb_;
-
-  /// Per-source multimap to efficiently track messages by timestamp
-  /// Key: timestamp, Value: message
-  /// This allows O(log n) insertion and O(1) minimum lookup per source
-  std::vector<std::multimap<uint64_t, PdesMsg>> per_source_msgs_;
-
+  const std::vector<std::unique_ptr<PdesRing>> *rings_{nullptr};
+  const std::vector<std::unique_ptr<std::atomic<uint64_t>>> *channel_lb_{
+      nullptr};
+  std::vector<uint64_t> read_seq_;
   uint32_t num_cores_{0};
+  uint32_t self_core_{0};
+
+  static thread_local uint32_t wait_backoff_;
 };
 
 /**
@@ -130,19 +155,19 @@ public:
   /// Get inbox for a specific LP
   PdesInbox &GetInbox(uint32_t core_id);
 
-  /// Send a message to a destination LP
-  void Send(const PdesMsg &msg);
+  /// Append a real coherence event to the source ring (arrival_time already
+  /// includes bus latency).
+  void AppendReal(uint32_t src_core, uint64_t arrival_time, PdesMsgKind kind,
+                  uint64_t line_addr);
 
-  /// Broadcast a real message to all other LPs (with bus latency)
-  void BroadcastReal(uint32_t src_core, uint64_t event_time, PdesMsgKind kind,
-                     uint64_t line_addr);
-
-  /// Send null messages to all other LPs
-  void BroadcastNull(uint32_t src_core, uint64_t null_ts);
+  /// Update the shared lower bound (replaces null messages)
+  void UpdateLowerBound(uint32_t src_core, uint64_t lb);
 
   uint32_t num_cores() const { return num_cores_; }
 
 private:
   uint32_t num_cores_{0};
   std::vector<std::unique_ptr<PdesInbox>> inboxes_;
+  std::vector<std::unique_ptr<PdesRing>> rings_;
+  std::vector<std::unique_ptr<std::atomic<uint64_t>>> channel_lb_;
 };

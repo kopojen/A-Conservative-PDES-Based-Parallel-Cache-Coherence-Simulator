@@ -27,7 +27,7 @@ struct PdesDebugInfo {
   uint64_t t_inbox{0};
   uint64_t t_next{0};
   uint64_t safe_time{0};
-  uint64_t last_null_sent{0};
+  uint64_t last_lb{0};
   uint64_t last_msg_received{0};
   uint64_t stuck_count{0};
 };
@@ -76,8 +76,8 @@ private:
   /// Handle a write access
   void HandleWrite(uint64_t line_addr);
 
-  /// Send null messages to advance lower bounds
-  void SendNullMessages();
+  /// Publish lower bound for this source (replaces null messages)
+  void PublishLowerBound();
 
   /// Normalize address to cache line
   static uint64_t NormalizeAddress(uint64_t addr);
@@ -106,8 +106,9 @@ private:
   uint64_t lvt_{0};               // Local Virtual Time
   uint64_t next_local_ts_{0};     // Timestamp of next local event
   bool has_next_local_{false};    // Whether there's a next local event
-  uint64_t last_null_sent_{0};    // Last null message timestamp sent
+  uint64_t last_lb_published_{0}; // Last lower bound published
   uint64_t last_msg_received_{0}; // Last message received timestamp
   uint64_t stuck_iterations_{0};  // Counter for stuck detection
   bool trace_exhausted_{false};   // Whether trace has been fully processed
+  bool done_signaled_{false};     // Whether done_count was incremented
 };

@@ -3,6 +3,7 @@ dataset/data/
 
 # Compilation
 /baseline
+/pdes
 simulator
 *.o
 

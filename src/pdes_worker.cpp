@@ -35,36 +35,36 @@ void PdesWorker::Initialize() {
     next_local_ts_ = first_ev->timestamp;
     has_next_local_ = true;
 
-    // Send initial null messages: "I won't send anything before t0 +
+    // Publish initial lower bound: "I won't send anything before t0 +
     // bus_latency"
-    uint64_t initial_null_ts = next_local_ts_ + kBusLatency;
-    channel_mgr_->BroadcastNull(core_id_, initial_null_ts);
-    last_null_sent_ = initial_null_ts;
+    uint64_t initial_lb = next_local_ts_ + kBusLatency;
+    channel_mgr_->UpdateLowerBound(core_id_, initial_lb);
+    last_lb_published_ = initial_lb;
   } else {
-    // No events in trace - send infinity null
+    // No events in trace - publish infinity
     has_next_local_ = false;
     trace_exhausted_ = true;
-    channel_mgr_->BroadcastNull(core_id_, kTimestampInfinity);
-    last_null_sent_ = kTimestampInfinity;
+    channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
+    last_lb_published_ = kTimestampInfinity;
   }
 }
 
-void PdesWorker::SendNullMessages() {
-  uint64_t null_ts;
+void PdesWorker::PublishLowerBound() {
+  uint64_t lb;
 
   if (has_next_local_) {
     // Next real message can only be sent when we process next_local_ts
     // So others won't see anything before next_local_ts + bus_latency
-    null_ts = next_local_ts_ + kBusLatency;
+    lb = next_local_ts_ + kBusLatency;
   } else {
     // Trace exhausted - we won't send any more real messages
-    null_ts = kTimestampInfinity;
+    lb = kTimestampInfinity;
   }
 
   // Only send if it advances the lower bound
-  if (null_ts > last_null_sent_) {
-    channel_mgr_->BroadcastNull(core_id_, null_ts);
-    last_null_sent_ = null_ts;
+  if (lb > last_lb_published_) {
+    channel_mgr_->UpdateLowerBound(core_id_, lb);
+    last_lb_published_ = lb;
   }
 }
 
@@ -79,8 +79,8 @@ void PdesWorker::HandleRead(uint64_t line_addr) {
 
   // Cache miss - broadcast read miss
   stats_->misses++;
-  channel_mgr_->BroadcastReal(core_id_, lvt_, PdesMsgKind::RealReadMiss,
-                              line_addr);
+  channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
+                           PdesMsgKind::RealReadMiss, line_addr);
   cache_.InsertOrUpdate(line_addr, MSICache::State::Shared);
 }
 
@@ -95,8 +95,8 @@ void PdesWorker::HandleWrite(uint64_t line_addr) {
 
   // Cache miss or upgrade - broadcast write miss
   stats_->misses++;
-  channel_mgr_->BroadcastReal(core_id_, lvt_, PdesMsgKind::RealWriteMiss,
-                              line_addr);
+  channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
+                           PdesMsgKind::RealWriteMiss, line_addr);
 
   if (state == MSICache::State::Shared) {
     cache_.SetState(line_addr, MSICache::State::Modified);
@@ -126,7 +126,6 @@ void PdesWorker::ProcessInboxEvent(const PdesMsg &msg) {
   } else if (msg.kind == PdesMsgKind::RealWriteMiss) {
     cache_.HandleExternalWriteMiss(msg.line_addr);
   }
-  // Null messages are handled in PdesInbox::Push
 }
 
 void PdesWorker::CheckStuck() {
@@ -148,7 +147,7 @@ void PdesWorker::CheckStuck() {
               << "  safe_time: "
               << (safe_time == kTimestampInfinity ? -1 : (int64_t)safe_time)
               << "\n"
-              << "  last_null_sent: " << last_null_sent_ << "\n"
+              << "  last_lb_published: " << last_lb_published_ << "\n"
               << "  last_msg_received: " << last_msg_received_ << "\n"
               << "  Channel lower bounds:\n";
 
@@ -168,7 +167,7 @@ PdesDebugInfo PdesWorker::GetDebugInfo() const {
   info.core_id = core_id_;
   info.lvt = lvt_;
   info.t_local = has_next_local_ ? next_local_ts_ : kTimestampInfinity;
-  info.last_null_sent = last_null_sent_;
+  info.last_lb = last_lb_published_;
   info.last_msg_received = last_msg_received_;
   info.stuck_count = stuck_iterations_;
   return info;
@@ -186,18 +185,24 @@ void PdesWorker::Run() {
       break;
     }
 
-    // Get timestamps for next events
+    // Get timestamps for next events (single pass for inbox + safe time)
     uint64_t t_local = has_next_local_ ? next_local_ts_ : kTimestampInfinity;
-    uint64_t t_inbox = inbox.PeekMinTimestamp();
+    auto scan = inbox.Scan(core_id_);
+    uint64_t t_inbox = scan.min_ts;
+    uint32_t min_src = scan.min_src;
+    uint64_t safe_time = scan.safe_time;
     uint64_t t_next = std::min(t_local, t_inbox);
 
     // If no more events to process
     if (t_next == kTimestampInfinity) {
       if (!trace_exhausted_) {
         trace_exhausted_ = true;
-        // Send final null message
-        channel_mgr_->BroadcastNull(core_id_, kTimestampInfinity);
-        last_null_sent_ = kTimestampInfinity;
+        // Publish final lower bound
+        channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
+        last_lb_published_ = kTimestampInfinity;
+      }
+      if (!done_signaled_) {
+        done_signaled_ = true;
         done_count_->fetch_add(1, std::memory_order_release);
       }
 
@@ -207,21 +212,29 @@ void PdesWorker::Run() {
       continue;
     }
 
-    // Compute CMB safe time
-    uint64_t safe_time = inbox.ComputeSafeTime(core_id_);
-
     // Can we process the next event?
+    //
+    // Determinism note (lock-free rings + CMB):
+    // safe_time only guarantees no messages earlier than the advertised lower
+    // bounds, but a remote message with timestamp == t_local may exist yet not
+    // be visible to this thread at the moment we scanned.
+    //
+    // To preserve deterministic semantics (remote-before-local on ties) and
+    // avoid run-to-run variation, we only allow a local event at time t when
+    // t < safe_time (strict). Remote events can still be processed at t when
+    // visible and t <= safe_time.
     if (t_next <= safe_time) {
       stuck_iterations_ = 0;
+      inbox.ResetWaitBackoff();
 
       if (t_inbox <= t_local && t_inbox != kTimestampInfinity) {
         // Process inbox event first (if tie, prefer inbox for consistency)
         PdesMsg msg;
-        if (inbox.TryPop(msg, safe_time)) {
+        if (inbox.TryPopFrom(min_src, safe_time, msg)) {
           lvt_ = msg.ts;
           ProcessInboxEvent(msg);
         }
-      } else if (t_local != kTimestampInfinity) {
+      } else if (t_local != kTimestampInfinity && t_local < safe_time) {
         // Process local event
         auto ev = reader_->Next();
         if (ev) {
@@ -237,17 +250,25 @@ void PdesWorker::Run() {
             has_next_local_ = false;
           }
 
-          // Send null messages to advance lower bounds
-          SendNullMessages();
+          // Publish lower bound to advance lower bounds
+          PublishLowerBound();
         }
+      } else {
+        // Cannot safely process a local event at the boundary (t_local ==
+        // safe_time). Wait until either the corresponding remote message
+        // becomes visible or all sources advance their lower bounds past t.
+        stuck_iterations_++;
+        CheckStuck();
+        PublishLowerBound();
+        inbox.WaitForMessage();
       }
     } else {
-      // Cannot process yet - wait for more null messages
+      // Cannot process yet - wait for more progress
       stuck_iterations_++;
       CheckStuck();
 
-      // Send null messages to help other cores make progress
-      SendNullMessages();
+      // Publish lower bound to help other cores make progress
+      PublishLowerBound();
 
       // Brief wait to avoid busy spinning
       inbox.WaitForMessage();
@@ -255,9 +276,12 @@ void PdesWorker::Run() {
   }
 
   // Mark as done if not already
-  if (!trace_exhausted_) {
-    trace_exhausted_ = true;
-    channel_mgr_->BroadcastNull(core_id_, kTimestampInfinity);
+  if (!done_signaled_) {
+    done_signaled_ = true;
+    if (!trace_exhausted_) {
+      trace_exhausted_ = true;
+      channel_mgr_->UpdateLowerBound(core_id_, kTimestampInfinity);
+    }
     done_count_->fetch_add(1, std::memory_order_release);
   }
 }
