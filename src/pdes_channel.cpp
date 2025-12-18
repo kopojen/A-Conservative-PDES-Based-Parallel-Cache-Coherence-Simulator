@@ -158,6 +158,7 @@ PdesInbox::ScanResult PdesInbox::Scan() const {
         res.min_ts = front.ts;
         res.min_src = src;
         res.min_src_msg_id = front.src_msg_id;
+        res.min_line_addr = front.line_addr;
       }
     }
   }

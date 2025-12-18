@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 
 PdesWorker::PdesWorker(uint32_t core_id, std::unique_ptr<TraceReader> reader,
                        PdesChannelManager &channel_mgr, CoreStats &stats,
@@ -28,12 +29,17 @@ uint64_t PdesWorker::NormalizeAddress(uint64_t addr) {
   return addr & ~(kLineSizeBytes - 1);
 }
 
+bool PdesWorker::IsSharedAddress(uint64_t addr) {
+  return addr >= kSharedAddressBase;
+}
+
 void PdesWorker::Initialize() {
   // Peek the first trace event
   auto first_ev = reader_->Peek();
   if (first_ev) {
     next_local_ts_ = first_ev->timestamp;
     has_next_local_ = true;
+    next_local_is_shared_ = IsSharedAddress(first_ev->address);
 
     // Publish initial lower bound: "I won't send anything before t0 +
     // bus_latency"
@@ -42,6 +48,7 @@ void PdesWorker::Initialize() {
   } else {
     // No events in trace - publish infinity
     has_next_local_ = false;
+    next_local_is_shared_ = false;
     trace_exhausted_ = true;
     UpdateLowerBoundCandidate();
     MaybePublishLowerBound(true);
@@ -68,7 +75,7 @@ void PdesWorker::UpdateLowerBoundCandidate() {
   lb_dirty_ = pending_lb_ > last_lb_published_;
 }
 
-void PdesWorker::HandleRead(uint64_t line_addr) {
+void PdesWorker::HandleRead(uint64_t line_addr, bool is_shared) {
   const auto state = cache_.GetState(line_addr);
 
   if (state == MSICache::State::Shared || state == MSICache::State::Modified) {
@@ -79,13 +86,15 @@ void PdesWorker::HandleRead(uint64_t line_addr) {
 
   // Cache miss - broadcast read miss
   stats_->misses++;
-  channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
-                           PdesMsgKind::RealReadMiss, line_addr,
-                           next_outgoing_msg_id_++);
+  if (is_shared) {
+    channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
+                             PdesMsgKind::RealReadMiss, line_addr,
+                             next_outgoing_msg_id_++);
+  }
   cache_.InsertOrUpdate(line_addr, MSICache::State::Shared);
 }
 
-void PdesWorker::HandleWrite(uint64_t line_addr) {
+void PdesWorker::HandleWrite(uint64_t line_addr, bool is_shared) {
   const auto state = cache_.GetState(line_addr);
 
   if (state == MSICache::State::Modified) {
@@ -96,9 +105,11 @@ void PdesWorker::HandleWrite(uint64_t line_addr) {
 
   // Cache miss or upgrade - broadcast write miss
   stats_->misses++;
-  channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
-                           PdesMsgKind::RealWriteMiss, line_addr,
-                           next_outgoing_msg_id_++);
+  if (is_shared) {
+    channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
+                             PdesMsgKind::RealWriteMiss, line_addr,
+                             next_outgoing_msg_id_++);
+  }
 
   if (state == MSICache::State::Shared) {
     cache_.SetState(line_addr, MSICache::State::Modified);
@@ -108,15 +119,15 @@ void PdesWorker::HandleWrite(uint64_t line_addr) {
   }
 }
 
-void PdesWorker::ProcessLocalEvent(const TraceEvent &ev) {
+void PdesWorker::ProcessLocalEvent(const TraceEvent &ev, bool is_shared) {
   const uint64_t line_addr = NormalizeAddress(ev.address);
 
   if (ev.is_write) {
     stats_->writes++;
-    HandleWrite(line_addr);
+    HandleWrite(line_addr, is_shared);
   } else {
     stats_->reads++;
-    HandleRead(line_addr);
+    HandleRead(line_addr, is_shared);
   }
 }
 
@@ -197,6 +208,11 @@ void PdesWorker::Run() {
     uint32_t min_src = scan.min_src;
     uint64_t safe_time = scan.safe_time;
     uint64_t t_next = std::min(t_local, t_inbox);
+    bool local_is_shared = has_next_local_ && next_local_is_shared_;
+    bool has_inbox_event =
+        (scan.min_src != std::numeric_limits<uint32_t>::max());
+    bool inbox_is_shared =
+        has_inbox_event && IsSharedAddress(scan.min_line_addr);
 
     // If no more events to process
     if (t_next == kTimestampInfinity) {
@@ -245,15 +261,17 @@ void PdesWorker::Run() {
         auto ev = reader_->Next();
         if (ev) {
           lvt_ = ev->timestamp;
-          ProcessLocalEvent(*ev);
+          ProcessLocalEvent(*ev, local_is_shared);
 
           // Update next local event
           auto next_ev = reader_->Peek();
           if (next_ev) {
             next_local_ts_ = next_ev->timestamp;
             has_next_local_ = true;
+            next_local_is_shared_ = IsSharedAddress(next_ev->address);
           } else {
             has_next_local_ = false;
+            next_local_is_shared_ = false;
           }
 
           // Update lower bound candidate and publish only if it advanced
@@ -269,6 +287,40 @@ void PdesWorker::Run() {
         MaybePublishLowerBound();
         inbox.Drain();
         inbox.WaitForMessage();
+      }
+    } else if (has_next_local_ && !local_is_shared) {
+      stuck_iterations_ = 0;
+      inbox.ResetWaitBackoff();
+
+      auto ev = reader_->Next();
+      if (ev) {
+        lvt_ = ev->timestamp;
+        ProcessLocalEvent(*ev, false);
+
+        auto next_ev = reader_->Peek();
+        if (next_ev) {
+          next_local_ts_ = next_ev->timestamp;
+          has_next_local_ = true;
+          next_local_is_shared_ = IsSharedAddress(next_ev->address);
+        } else {
+          has_next_local_ = false;
+          next_local_is_shared_ = false;
+        }
+
+        UpdateLowerBoundCandidate();
+        MaybePublishLowerBound();
+      } else {
+        has_next_local_ = false;
+        next_local_is_shared_ = false;
+      }
+    } else if (has_inbox_event && !inbox_is_shared) {
+      stuck_iterations_ = 0;
+      inbox.ResetWaitBackoff();
+
+      PdesMsg msg;
+      if (inbox.TryPopFrom(min_src, kTimestampInfinity, msg)) {
+        lvt_ = msg.ts;
+        ProcessInboxEvent(msg);
       }
     } else {
       // Cannot process yet - wait for more progress

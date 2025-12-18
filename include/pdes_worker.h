@@ -65,16 +65,16 @@ private:
   void Initialize();
 
   /// Process a local trace event
-  void ProcessLocalEvent(const TraceEvent &ev);
+  void ProcessLocalEvent(const TraceEvent &ev, bool is_shared);
 
   /// Process an inbox message (coherence event from another core)
   void ProcessInboxEvent(const PdesMsg &msg);
 
   /// Handle a read access
-  void HandleRead(uint64_t line_addr);
+  void HandleRead(uint64_t line_addr, bool is_shared);
 
   /// Handle a write access
-  void HandleWrite(uint64_t line_addr);
+  void HandleWrite(uint64_t line_addr, bool is_shared);
 
   /// Publish lower bound for this source (replaces null messages)
   void MaybePublishLowerBound(bool force = false);
@@ -82,6 +82,7 @@ private:
 
   /// Normalize address to cache line
   static uint64_t NormalizeAddress(uint64_t addr);
+  static bool IsSharedAddress(uint64_t addr);
 
   /// Check for stuck condition and log debug info
   void CheckStuck();
@@ -92,6 +93,7 @@ private:
   static constexpr uint32_t kAssociativity = 8;
   static constexpr uint64_t kStuckThreshold =
       100000; // iterations before warning
+  static constexpr uint64_t kSharedAddressBase = 0x10000000ull;
 
   uint32_t core_id_{0};
   std::unique_ptr<TraceReader> reader_;
@@ -107,6 +109,7 @@ private:
   uint64_t lvt_{0};               // Local Virtual Time
   uint64_t next_local_ts_{0};     // Timestamp of next local event
   bool has_next_local_{false};    // Whether there's a next local event
+  bool next_local_is_shared_{false};
   uint64_t last_lb_published_{0}; // Last lower bound published
   uint64_t pending_lb_{0};        // Candidate lower bound to publish
   bool lb_dirty_{false};          // Whether pending_lb_ needs publishing

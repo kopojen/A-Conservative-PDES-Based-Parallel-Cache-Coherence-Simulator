@@ -138,6 +138,7 @@ public:
     uint64_t min_ts{kTimestampInfinity};
     uint32_t min_src{std::numeric_limits<uint32_t>::max()};
     uint64_t min_src_msg_id{0};
+    uint64_t min_line_addr{0};
     uint64_t safe_time{kTimestampInfinity};
   };
 
