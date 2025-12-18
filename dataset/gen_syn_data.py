@@ -38,7 +38,7 @@ def clamp_align(addr: int, low: int, high: int, align: int = 64) -> int:
 
 def main(
     seed: int = 1234,
-    num_cores: int = 32,
+    num_cores: int = 64,
     t_max: int = 700000,
     target_accesses_per_core: int = 100000,
     out_prefix: str = "core",
@@ -94,7 +94,7 @@ def main(
     # Address selection model:
     # - shared is more likely than private overall (as you asked)
     # - within each space, prefer hot set, then loop, then walk, then random
-    REGION_SHARED_PROB = 0.62  # shared access chance higher than private
+    REGION_SHARED_PROB = 0.3  # shared access chance higher than private
 
     for ts in range(t_max + 1):
         # For each core, maybe emit one access at this timestamp
