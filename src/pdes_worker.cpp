@@ -80,7 +80,8 @@ void PdesWorker::HandleRead(uint64_t line_addr) {
   // Cache miss - broadcast read miss
   stats_->misses++;
   channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
-                           PdesMsgKind::RealReadMiss, line_addr);
+                           PdesMsgKind::RealReadMiss, line_addr,
+                           next_outgoing_msg_id_++);
   cache_.InsertOrUpdate(line_addr, MSICache::State::Shared);
 }
 
@@ -96,7 +97,8 @@ void PdesWorker::HandleWrite(uint64_t line_addr) {
   // Cache miss or upgrade - broadcast write miss
   stats_->misses++;
   channel_mgr_->AppendReal(core_id_, lvt_ + kBusLatency,
-                           PdesMsgKind::RealWriteMiss, line_addr);
+                           PdesMsgKind::RealWriteMiss, line_addr,
+                           next_outgoing_msg_id_++);
 
   if (state == MSICache::State::Shared) {
     cache_.SetState(line_addr, MSICache::State::Modified);
@@ -131,6 +133,7 @@ void PdesWorker::ProcessInboxEvent(const PdesMsg &msg) {
 void PdesWorker::CheckStuck() {
   if (stuck_iterations_ > 0 && stuck_iterations_ % kStuckThreshold == 0) {
     auto &inbox = channel_mgr_->GetInbox(core_id_);
+    inbox.Drain();
     uint64_t safe_time = inbox.ComputeSafeTime(core_id_);
     uint64_t t_inbox = inbox.PeekMinTimestamp();
     uint64_t t_local = has_next_local_ ? next_local_ts_ : kTimestampInfinity;
@@ -180,6 +183,8 @@ void PdesWorker::Run() {
   uint32_t num_cores = channel_mgr_->num_cores();
 
   while (!stop_flag_->load(std::memory_order_relaxed)) {
+    inbox.Drain();
+
     // Check if all cores are done
     if (done_count_->load(std::memory_order_acquire) >= num_cores) {
       break;
@@ -187,7 +192,7 @@ void PdesWorker::Run() {
 
     // Get timestamps for next events (single pass for inbox + safe time)
     uint64_t t_local = has_next_local_ ? next_local_ts_ : kTimestampInfinity;
-    auto scan = inbox.Scan(core_id_);
+    auto scan = inbox.Scan();
     uint64_t t_inbox = scan.min_ts;
     uint32_t min_src = scan.min_src;
     uint64_t safe_time = scan.safe_time;
@@ -207,6 +212,7 @@ void PdesWorker::Run() {
       }
 
       // Wait a bit and check again (other cores might still send messages)
+      inbox.Drain();
       inbox.WaitForMessage();
       stuck_iterations_ = 0;
       continue;
@@ -261,6 +267,7 @@ void PdesWorker::Run() {
         stuck_iterations_++;
         CheckStuck();
         MaybePublishLowerBound();
+        inbox.Drain();
         inbox.WaitForMessage();
       }
     } else {
@@ -272,6 +279,7 @@ void PdesWorker::Run() {
       MaybePublishLowerBound();
 
       // Brief wait to avoid busy spinning
+      inbox.Drain();
       inbox.WaitForMessage();
     }
   }

@@ -114,4 +114,5 @@ private:
   uint64_t stuck_iterations_{0};  // Counter for stuck detection
   bool trace_exhausted_{false};   // Whether trace has been fully processed
   bool done_signaled_{false};     // Whether done_count was incremented
+  uint64_t next_outgoing_msg_id_{0}; // Per-source deterministic msg id
 };

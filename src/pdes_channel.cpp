@@ -7,25 +7,26 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 
 // ============================================================================
-// Ring buffer (single writer, multiple readers)
+// Ring buffer (multi-writer, multiple readers)
 // ============================================================================
 
 void PdesRing::Append(uint64_t ts, PdesMsgKind kind, uint32_t src,
-                      uint64_t line_addr) {
-  const uint64_t seq = next_seq_.load(std::memory_order_relaxed);
+                      uint64_t line_addr, uint64_t src_msg_id) {
+  const uint64_t seq =
+      next_seq_.fetch_add(1, std::memory_order_acq_rel);
   auto &slot = buffer_[seq % capacity_];
 
   slot.kind = kind;
   slot.src = src;
   slot.ts = ts;
   slot.line_addr = line_addr;
-  slot.seq.store(seq, std::memory_order_release);
-
-  next_seq_.store(seq + 1, std::memory_order_release);
+  slot.src_msg_id = src_msg_id;
+  slot.seq.store(seq + 1, std::memory_order_release);
 }
 
 bool PdesRing::Read(uint64_t seq, PdesMsg &msg) const {
@@ -36,11 +37,12 @@ bool PdesRing::Read(uint64_t seq, PdesMsg &msg) const {
 
   const auto &slot = buffer_[seq % capacity_];
   const uint64_t slot_seq = slot.seq.load(std::memory_order_acquire);
+  const uint64_t desired = seq + 1;
 
-  if (slot_seq < seq) {
+  if (slot_seq < desired) {
     return false; // Not yet published for this seq
   }
-  if (slot_seq != seq) {
+  if (slot_seq > desired) {
     throw std::runtime_error("Ring buffer overrun for PDES channel");
   }
 
@@ -48,6 +50,7 @@ bool PdesRing::Read(uint64_t seq, PdesMsg &msg) const {
   msg.src = slot.src;
   msg.ts = slot.ts;
   msg.line_addr = slot.line_addr;
+  msg.src_msg_id = slot.src_msg_id;
   return true;
 }
 
@@ -59,28 +62,45 @@ uint64_t PdesRing::PublishedSeq() const {
 // PdesInbox Implementation
 // ============================================================================
 
-PdesInbox::PdesInbox(uint32_t self_core,
-                     const std::vector<std::unique_ptr<PdesRing>> &rings,
+PdesInbox::PdesInbox(uint32_t self_core, const PdesRing &ring,
                      const std::vector<ChannelLowerBound> &channel_lb)
-    : rings_(&rings), channel_lb_(&channel_lb), num_cores_(rings.size()),
-      self_core_(self_core) {
-  read_seq_.assign(num_cores_, 0);
+    : ring_(&ring), channel_lb_(&channel_lb),
+      per_src_queues_(channel_lb.size()), num_cores_(channel_lb.size()),
+      self_core_(self_core) {}
+
+void PdesInbox::Drain() {
+  if (ring_ == nullptr) {
+    return;
+  }
+
+  while (true) {
+    uint64_t published = ring_->PublishedSeq();
+    if (drain_seq_ >= published) {
+      break;
+    }
+
+    PdesMsg msg;
+    while (!ring_->Read(drain_seq_, msg)) {
+      std::this_thread::yield();
+    }
+    ++drain_seq_;
+
+    if (msg.src == self_core_) {
+      continue;
+    }
+    per_src_queues_[msg.src].push_back(msg);
+  }
 }
 
 uint64_t PdesInbox::NextTimestampFrom(uint32_t src) const {
-  // Fast path: if the source hasn't published anything beyond our read pointer,
-  // we know there is no readable message without touching the ring slots.
-  const auto &ring = *rings_->at(src);
-  const uint64_t published = ring.PublishedSeq();
-  if (read_seq_[src] >= published) {
+  if (src == self_core_) {
     return kTimestampInfinity;
   }
-
-  PdesMsg tmp;
-  if (ring.Read(read_seq_[src], tmp)) {
-    return tmp.ts;
+  const auto &queue = per_src_queues_[src];
+  if (queue.empty()) {
+    return kTimestampInfinity;
   }
-  return kTimestampInfinity;
+  return queue.front().ts;
 }
 
 uint64_t PdesInbox::PeekMinTimestamp() const {
@@ -103,24 +123,42 @@ uint64_t PdesInbox::GetChannelLowerBound(uint32_t src) const {
   return channel_lb_->at(src).value.load(std::memory_order_acquire);
 }
 
-PdesInbox::ScanResult PdesInbox::Scan(uint32_t self_core) const {
+PdesInbox::ScanResult PdesInbox::Scan() const {
   ScanResult res;
 
   for (uint32_t src = 0; src < num_cores_; ++src) {
-    if (src == self_core) {
+    if (src == self_core_) {
       continue;
     }
 
+    const auto &queue = per_src_queues_[src];
+    uint64_t qmin = queue.empty() ? kTimestampInfinity : queue.front().ts;
     uint64_t lb = channel_lb_->at(src).value.load(std::memory_order_acquire);
-    uint64_t qmin = NextTimestampFrom(src);
     uint64_t cmin = std::min(lb, qmin);
 
     if (cmin < res.safe_time) {
       res.safe_time = cmin;
     }
-    if (qmin < res.min_ts) {
-      res.min_ts = qmin;
-      res.min_src = src;
+
+    if (!queue.empty()) {
+      const auto &front = queue.front();
+      bool update = false;
+      if (front.ts < res.min_ts) {
+        update = true;
+      } else if (front.ts == res.min_ts) {
+        if (src < res.min_src) {
+          update = true;
+        } else if (src == res.min_src &&
+                   front.src_msg_id < res.min_src_msg_id) {
+          update = true;
+        }
+      }
+
+      if (update) {
+        res.min_ts = front.ts;
+        res.min_src = src;
+        res.min_src_msg_id = front.src_msg_id;
+      }
     }
   }
 
@@ -158,16 +196,24 @@ uint64_t PdesInbox::GetMinRealMsgTimestamp(uint32_t src) const {
 bool PdesInbox::TryPop(PdesMsg &msg, uint64_t safe_time) {
   uint64_t min_ts = kTimestampInfinity;
   uint32_t min_src = num_cores_;
+  uint64_t min_msg_id = 0;
 
   for (uint32_t src = 0; src < num_cores_; ++src) {
     if (src == self_core_) {
       continue;
     }
-
-    uint64_t ts = NextTimestampFrom(src);
-    if (ts < min_ts) {
-      min_ts = ts;
+    const auto &queue = per_src_queues_[src];
+    if (queue.empty()) {
+      continue;
+    }
+    const auto &front = queue.front();
+    if (front.ts < min_ts ||
+        (front.ts == min_ts &&
+         (src < min_src ||
+          (src == min_src && front.src_msg_id < min_msg_id)))) {
+      min_ts = front.ts;
       min_src = src;
+      min_msg_id = front.src_msg_id;
     }
   }
 
@@ -175,12 +221,10 @@ bool PdesInbox::TryPop(PdesMsg &msg, uint64_t safe_time) {
     return false;
   }
 
-  if (!rings_->at(min_src)->Read(read_seq_[min_src], msg)) {
-    return false;
-  }
-
+  auto &queue = per_src_queues_[min_src];
+  msg = queue.front();
+  queue.pop_front();
   msg.dst = self_core_;
-  read_seq_[min_src]++;
   return true;
 }
 
@@ -189,14 +233,17 @@ bool PdesInbox::TryPopFrom(uint32_t src, uint64_t safe_time, PdesMsg &msg) {
     return false;
   }
 
-  if (!rings_->at(src)->Read(read_seq_[src], msg)) {
+  auto &queue = per_src_queues_[src];
+  if (queue.empty()) {
     return false;
   }
-  if (msg.ts > safe_time) {
+  const auto &front = queue.front();
+  if (front.ts > safe_time) {
     return false;
   }
+  msg = front;
+  queue.pop_front();
   msg.dst = self_core_;
-  read_seq_[src]++;
   return true;
 }
 
@@ -227,18 +274,24 @@ PdesChannelManager::PdesChannelManager(uint32_t num_cores)
     throw std::invalid_argument("num_cores must be > 0");
   }
 
-  rings_.reserve(num_cores);
+  if (static_cast<size_t>(num_cores) >
+      std::numeric_limits<size_t>::max() / kRingCapacityPerSource) {
+    throw std::overflow_error("Too many cores for PDES ring capacity");
+  }
+  size_t ring_capacity =
+      kRingCapacityPerSource * static_cast<size_t>(num_cores);
+  ring_ = std::make_unique<PdesRing>(ring_capacity);
+
   channel_lb_.reserve(num_cores);
   inboxes_.reserve(num_cores);
 
   for (uint32_t i = 0; i < num_cores; ++i) {
-    rings_.push_back(std::make_unique<PdesRing>());
     channel_lb_.push_back(ChannelLowerBound{});
   }
 
   for (uint32_t i = 0; i < num_cores; ++i) {
     inboxes_.push_back(
-        std::make_unique<PdesInbox>(i, rings_, channel_lb_));
+        std::make_unique<PdesInbox>(i, *ring_, channel_lb_));
   }
 }
 
@@ -247,8 +300,9 @@ PdesInbox &PdesChannelManager::GetInbox(uint32_t core_id) {
 }
 
 void PdesChannelManager::AppendReal(uint32_t src_core, uint64_t arrival_time,
-                                    PdesMsgKind kind, uint64_t line_addr) {
-  rings_[src_core]->Append(arrival_time, kind, src_core, line_addr);
+                                    PdesMsgKind kind, uint64_t line_addr,
+                                    uint64_t src_msg_id) {
+  ring_->Append(arrival_time, kind, src_core, line_addr, src_msg_id);
 }
 
 void PdesChannelManager::UpdateLowerBound(uint32_t src_core, uint64_t lb) {

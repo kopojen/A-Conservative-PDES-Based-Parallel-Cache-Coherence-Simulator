@@ -13,12 +13,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
 
-constexpr size_t kRingCapacity = 1ull << 20; // Per-source ring capacity
+constexpr size_t kRingCapacityPerSource = 1ull << 6;
 
 /// Bus latency in cycles (lookahead > 0 to avoid deadlock)
 constexpr uint64_t kBusLatency = 1;
@@ -66,6 +67,7 @@ struct PdesMsg {
   uint32_t dst{0};       ///< Destination core ID
   uint64_t ts{0};        ///< Timestamp (arrival time at destination)
   uint64_t line_addr{0}; ///< Cache line address (for real messages)
+  uint64_t src_msg_id{0}; ///< Per-source deterministic ordering key
 
   /// Comparison for min-heap (earlier timestamp = higher priority)
   bool operator>(const PdesMsg &other) const {
@@ -76,7 +78,9 @@ struct PdesMsg {
       return true;
     if (kind != PdesMsgKind::Null && other.kind == PdesMsgKind::Null)
       return false;
-    return src > other.src;
+    if (src != other.src)
+      return src > other.src;
+    return src_msg_id > other.src_msg_id;
   }
 };
 
@@ -84,27 +88,29 @@ struct PdesMsg {
  * @brief Thread-safe inbox for receiving PDES messages.
  *
  * Implements a lock-free shared broadcast log:
- * - Each source core owns a single-writer ring buffer.
- * - All destination cores maintain per-source read pointers.
+ * - All cores append to a single global ring (append-only, no mutex).
+ * - Each destination maintains a drain pointer and per-source local queues.
  * - Lower bounds are advertised via a shared atomic array (replacing null
  *   messages).
  */
 class PdesRing {
 public:
-  PdesRing() : capacity_(kRingCapacity), buffer_(capacity_) {}
+  explicit PdesRing(size_t capacity)
+      : capacity_(capacity), buffer_(capacity_) {}
 
   void Append(uint64_t ts, PdesMsgKind kind, uint32_t src,
-              uint64_t line_addr);
+              uint64_t line_addr, uint64_t src_msg_id);
   bool Read(uint64_t seq, PdesMsg &msg) const;
   uint64_t PublishedSeq() const;
 
 private:
   struct Slot {
-    std::atomic<uint64_t> seq{kTimestampInfinity};
+    std::atomic<uint64_t> seq{0};
     PdesMsgKind kind{PdesMsgKind::Null};
     uint32_t src{0};
     uint64_t ts{0};
     uint64_t line_addr{0};
+    uint64_t src_msg_id{0};
   };
 
   size_t capacity_;
@@ -115,8 +121,11 @@ private:
 class PdesInbox {
 public:
   PdesInbox(uint32_t self_core,
-            const std::vector<std::unique_ptr<PdesRing>> &rings,
+            const PdesRing &ring,
             const std::vector<ChannelLowerBound> &channel_lb);
+
+  /// Drain the global ring into the per-core inbox queues
+  void Drain();
 
   /// Try to pop the earliest readable message (non-blocking)
   bool TryPop(PdesMsg &msg, uint64_t safe_time);
@@ -128,11 +137,12 @@ public:
   struct ScanResult {
     uint64_t min_ts{kTimestampInfinity};
     uint32_t min_src{std::numeric_limits<uint32_t>::max()};
+    uint64_t min_src_msg_id{0};
     uint64_t safe_time{kTimestampInfinity};
   };
 
   /// Single pass to get earliest inbox ts and safe_time together
-  ScanResult Scan(uint32_t self_core) const;
+  ScanResult Scan() const;
 
   /// Peek at the earliest unread remote message timestamp
   uint64_t PeekMinTimestamp() const;
@@ -154,9 +164,10 @@ public:
 private:
   uint64_t NextTimestampFrom(uint32_t src) const;
 
-  const std::vector<std::unique_ptr<PdesRing>> *rings_{nullptr};
+  const PdesRing *ring_{nullptr};
   const std::vector<ChannelLowerBound> *channel_lb_{nullptr};
-  std::vector<uint64_t> read_seq_;
+  std::vector<std::deque<PdesMsg>> per_src_queues_;
+  uint64_t drain_seq_{0};
   uint32_t num_cores_{0};
   uint32_t self_core_{0};
 
@@ -179,7 +190,7 @@ public:
   /// Append a real coherence event to the source ring (arrival_time already
   /// includes bus latency).
   void AppendReal(uint32_t src_core, uint64_t arrival_time, PdesMsgKind kind,
-                  uint64_t line_addr);
+                  uint64_t line_addr, uint64_t src_msg_id);
 
   /// Update the shared lower bound (replaces null messages)
   void UpdateLowerBound(uint32_t src_core, uint64_t lb);
@@ -189,6 +200,6 @@ public:
 private:
   uint32_t num_cores_{0};
   std::vector<std::unique_ptr<PdesInbox>> inboxes_;
-  std::vector<std::unique_ptr<PdesRing>> rings_;
+  std::unique_ptr<PdesRing> ring_;
   std::vector<ChannelLowerBound> channel_lb_;
 };
