@@ -1,6 +1,12 @@
 # Cache Coherence Simulator
 
-Sequential simulator for multi-core memory traces using MSI cache coherence protocol.
+Multi-core cache simulator driven by timestamped traces.
+
+- Each core is modeled as a Logical Process (LP) running in its own thread.
+- Coherence uses an MSI-like snoopy broadcast model.
+- Parallel execution uses **Conservative PDES** with **CMB (Chandy–Misra–Bryant)** safe-time.
+- Inter-core coherence events are communicated via a **lock-free per-source ring buffer**
+  plus a shared **atomic lower-bound** array (replacing null-message broadcast).
 
 ## Quick Start
 
@@ -24,18 +30,22 @@ Either by using the traces we have processed or by downloading the original trac
 g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
     -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp src/bus.cpp \
     -o baseline
+
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
+    -I./include src/main.cpp src/trace_reader.cpp src/msi_cache.cpp src/pdes_channel.cpp src/pdes_worker.cpp \
+    -o pdes
 ```
 
 ### 3. Run
 
 Single core:
 ```bash
-./baseline dataset/data/MT0-canneal
+./baseline dataset/core0.trace
 ```
 
 Multiple cores:
 ```bash
-./baseline dataset/data/MT{0,1,2,3}-canneal
+./pdes dataset/core*.trace
 ```
 
 ## Cache Configuration
@@ -44,15 +54,44 @@ The simulator models private L1 caches with the following parameters:
 - 64-byte cache lines (addresses normalized to line granularity)
 - 32 KB capacity per core, implemented as 64 sets with 8-way associativity
 - True LRU replacement within each set
-- MSI coherence maintained via a snoopy bus protocol
+- MSI coherence maintained via a snoopy broadcast model
 - All caches are L1 only; there is no shared lower-level cache
+
+## PDES / Coherence Model (Current Implementation)
+
+### Event types
+- **Local events**: timestamped `R/W` accesses from each core's trace.
+- **Remote events**: coherence snoop events generated on local misses:
+  - `RealReadMiss`
+  - `RealWriteMiss`
+
+### Timing
+- A coherence event generated at local virtual time `lvt` is observed by other cores at
+  `arrival_time = lvt + kBusLatency` (see `include/pdes_channel.h`).
+- Each core continuously publishes a **lower bound** `lb[core]`:
+  `lb = next_local_ts + kBusLatency` (or `∞` when the trace is exhausted).
+
+### Safe-time (CMB)
+Each core computes:
+\[
+safe\_time = \min_{src \neq self} \min(lb[src], qmin[src])
+\]
+where `qmin[src]` is the timestamp of the next unread remote event from source `src`.
+
+### Determinism note
+To make results deterministic with lock-free rings, the scheduler enforces:
+- **Remote events are processed before local events on timestamp ties**, and
+- **Local events at the boundary are only allowed when `t_local < safe_time` (strict)**.
+
+This avoids run-to-run variation when a remote event at the same timestamp exists but
+is not yet visible during the current scan.
 
 ## Code Structure
 
 ### `src/main.cpp`
 - Parses command-line arguments and builds a trace reader per requested core
-- Registers every core with the global snoopy bus and spawns one worker thread per core
-- Each worker thread processes its own trace stream, drives its private cache, and consumes bus events
+- Creates the PDES channel manager and spawns one worker thread per core
+- Each worker thread processes its own trace stream, drives its private cache, and consumes coherence events
 - Global hit/miss statistics are aggregated after all workers finish
 
 ### `src/trace_reader.cpp`
@@ -65,6 +104,10 @@ The simulator models private L1 caches with the following parameters:
 - Maintains cache line states: Invalid, Shared, Modified
 - Tracks per-core hit/miss statistics
 
-### `src/bus.cpp`
-- Implements the global lock-free ring buffer used to broadcast snoopy events
-- Each broadcast reserves a slot via an atomic tail pointer; subscribers track their own read indices
+### `src/pdes_channel.cpp`
+- Implements the lock-free **per-source ring buffers** for coherence events
+- Implements the shared **lower bound** array used by CMB safe-time
+
+### `src/pdes_worker.cpp`
+- One worker per core (LP)
+- Conservative PDES main loop: chooses the next safe event (local vs remote) and updates the private cache

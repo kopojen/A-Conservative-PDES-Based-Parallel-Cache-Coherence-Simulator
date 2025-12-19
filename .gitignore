@@ -3,7 +3,13 @@ dataset/data/
 
 # Compilation
 /baseline
+/pdes
+simulator
 *.o
 
 # Others
 .DS_Store
+.cache/
+.vscode/
+.clangd
+compile_commands.json

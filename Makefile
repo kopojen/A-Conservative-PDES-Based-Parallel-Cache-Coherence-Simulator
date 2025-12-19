@@ -6,10 +6,11 @@ SRC_DIR := src
 SRCS := $(SRC_DIR)/main.cpp \
         $(SRC_DIR)/trace_reader.cpp \
         $(SRC_DIR)/msi_cache.cpp \
-		$(SRC_DIR)/bus.cpp
+        $(SRC_DIR)/pdes_channel.cpp \
+        $(SRC_DIR)/pdes_worker.cpp
 OBJS := $(SRCS:.cpp=.o)
 
-TARGET ?= baseline
+TARGET ?= simulator
 TRACE ?= dataset/data/MT0-canneal
 
 .PHONY: all clean run
